@@ -81,9 +81,9 @@ st.set_page_config(page_title=APP_NAME, page_icon="🗺️", layout="wide")
 st.markdown(
     """
     <style>
-    .block-container {padding-top: 1rem; padding-bottom: 2rem;}
+    .block-container {padding-top: 3.25rem; padding-bottom: 2rem;}
     .small-note {font-size: .86rem; color: #777;}
-    .big-title {font-size: 2.05rem; font-weight: 800; margin-bottom: .1rem;}
+    .big-title {font-size: 2.05rem; font-weight: 800; line-height: 1.25; padding-top: .75rem; margin-top: .25rem; margin-bottom: .35rem; overflow: visible;}
     .section-title {font-size: 1.22rem; font-weight: 750; margin-top: .8rem; margin-bottom: .4rem;}
     div[data-testid="stMetric"] {border: 1px solid rgba(128,128,128,.22); border-radius: 16px; padding: .75rem .9rem; background: rgba(128,128,128,.04);}
     </style>
