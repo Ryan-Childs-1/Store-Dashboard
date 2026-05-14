@@ -1,20 +1,25 @@
-# Store AI Dashboard
+# Store Performance & Market Dashboard
 
-A GitHub-ready Streamlit dashboard for exploring store locations, state-level market statistics, national rollups, and AI-style forecasts using bundled population and GDP data plus an uploaded `Store List v1.csv` file.
+A GitHub-ready Streamlit dashboard for analyzing a retail store list against bundled state population and GDP data.
 
-## Files included in this repository
+## Files in this folder
+
+All files are intentionally kept in the same folder for GitHub / Streamlit Cloud compatibility:
 
 ```text
-store_ai_dashboard/
-├── app.py
-├── requirements.txt
-├── README.md
-└── 
-    ├── US States Ranked by Population 2024.csv
-    └── SAGDP2N__ALL_AREAS_1997_2020.csv
+app.py
+requirements.txt
+README.md
+US States Ranked by Population 2024.csv
+SAGDP2N__ALL_AREAS_1997_2020.csv
+.streamlit/config.toml
 ```
 
-The app intentionally does **not** bundle `Store List v1.csv`. Upload it in the sidebar after launching the dashboard.
+The app asks the user to upload the third file at runtime:
+
+```text
+Store List v1.csv
+```
 
 ## Run locally
 
@@ -23,20 +28,25 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Deploy on Streamlit Cloud
+Then upload `Store List v1.csv` in the sidebar.
 
-1. Upload this folder to a GitHub repository.
-2. In Streamlit Cloud, select `app.py` as the entry point.
-3. Add no secrets. The app runs locally from bundled CSVs and the uploaded store list.
-4. Launch the app and upload `Store List v1.csv` in the sidebar.
+## Main dashboard features
+
+The previous AI forecast tab has been removed. The dashboard now focuses on explainable business metrics and benchmarking:
+
+1. Revenue per square foot
+2. Year-over-year growth
+3. Store density by population
+4. Revenue per capita
+5. Store productivity index
+6. Volume stability
+7. Category / market flag performance
+8. Market opportunity score
+9. Volume band movement
+10. Store age / maturity analysis
 
 ## Notes
 
-- The dashboard uses built-in state centroids with deterministic jitter for store map points because the store list contains addresses but no latitude/longitude columns.
-- If future store files include `lat/lon`, `latitude/longitude`, or similar columns, the app will automatically use those exact coordinates.
-- The forecasting engine is implemented from scratch as a lightweight LSTM-reservoir model. It uses explicit LSTM gate equations with fixed recurrent weights and a trained ridge readout, avoiding TensorFlow/PyTorch installation issues on Streamlit Cloud.
-
-
-## Flat GitHub File Layout
-
-This version keeps the bundled CSV files in the same folder as `app.py` for simple GitHub / Streamlit Cloud deployment. Do not place the population or GDP CSVs inside a `data` subfolder.
+- Store volume fields such as `24 Volume` are automatically scaled to dollars when the app detects that they are stored in thousands.
+- If exact latitude/longitude columns are not provided in the store list, store locations are plotted using state centroids plus deterministic jitter so that locations remain visible on the map.
+- The map supports state-level drilldown through the sidebar. Newer Streamlit versions also support point selection on the map markers.
