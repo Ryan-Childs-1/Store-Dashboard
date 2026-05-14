@@ -445,8 +445,15 @@ def state_row(summary: pd.DataFrame, selected_state: str) -> pd.Series:
 # Plot helpers
 # -----------------------------
 def metric_choropleth(summary: pd.DataFrame, metric: str, title: str) -> go.Figure:
+    # Important: keep the choropleth store count tied to the actual state summary,
+    # not to the marker size used for clickable state labels.
+    plot_df = summary.copy()
+    if "Store_Count" in plot_df.columns:
+        plot_df["Store_Count"] = pd.to_numeric(plot_df["Store_Count"], errors="coerce").fillna(0).astype(int)
+
+    hover_fmt = ":,.0f" if metric == "Store_Count" else ":,.2f"
     fig = px.choropleth(
-        summary,
+        plot_df,
         locations="State Abbr",
         locationmode="USA-states",
         color=metric,
@@ -454,23 +461,33 @@ def metric_choropleth(summary: pd.DataFrame, metric: str, title: str) -> go.Figu
         hover_name="State",
         hover_data={
             "State Abbr": True,
-            "Store_Count": ":,.0f" if "Store_Count" in summary.columns else False,
-            "Volume_2024": ":,.0f" if "Volume_2024" in summary.columns else False,
-            metric: ":,.2f",
+            "Store_Count": ":,.0f" if "Store_Count" in plot_df.columns else False,
+            "Volume_2024": ":,.0f" if "Volume_2024" in plot_df.columns else False,
+            metric: hover_fmt,
         },
         title=title,
     )
-    # Add clickable centroid markers. Click/select one to drill into a state.
-    map_points = summary.dropna(subset=["State Abbr"]).copy()
+
+    # Add clickable centroid markers. The marker size is only a visual cue;
+    # the hover label now shows the actual store count from customdata.
+    map_points = plot_df.dropna(subset=["State Abbr"]).copy()
     map_points["lat"] = map_points["State Abbr"].map(lambda a: STATE_CENTROIDS.get(a, (np.nan, np.nan))[0])
     map_points["lon"] = map_points["State Abbr"].map(lambda a: STATE_CENTROIDS.get(a, (np.nan, np.nan))[1])
     map_points = map_points.dropna(subset=["lat", "lon"])
+    map_points["Store_Count"] = pd.to_numeric(map_points.get("Store_Count", 0), errors="coerce").fillna(0).astype(int)
+    map_points["Marker_Size"] = np.clip(map_points["Store_Count"] * 3 + 9, 9, 30)
+    map_points["State_Label"] = np.where(
+        metric == "Store_Count",
+        map_points["State Abbr"].astype(str) + "<br>" + map_points["Store_Count"].astype(str),
+        map_points["State Abbr"].astype(str),
+    )
+
     fig.add_trace(go.Scattergeo(
         lat=map_points["lat"], lon=map_points["lon"], mode="markers+text",
-        text=map_points["State Abbr"], textposition="middle center",
-        marker=dict(size=np.clip(map_points["Store_Count"].fillna(0) * 3 + 9, 9, 30), color="rgba(20,20,20,.35)", line=dict(width=1, color="white")),
-        customdata=map_points[["State Abbr"]].to_numpy(),
-        hovertemplate="%{text}<br>Stores: %{marker.size}<extra>Click/select to drill in</extra>",
+        text=map_points["State_Label"], textposition="middle center",
+        marker=dict(size=map_points["Marker_Size"], color="rgba(20,20,20,.35)", line=dict(width=1, color="white")),
+        customdata=map_points[["State Abbr", "Store_Count"]].to_numpy(),
+        hovertemplate="%{customdata[0]}<br>Stores: %{customdata[1]:,.0f}<extra>Click/select to drill in</extra>",
         name="Clickable states",
     ))
     fig.update_layout(height=520, margin=dict(l=10, r=10, t=50, b=10), showlegend=False)
