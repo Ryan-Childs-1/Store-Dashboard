@@ -150,10 +150,17 @@ def fmt_pct(x: float) -> str:
 
 
 def rank_pct(s: pd.Series, higher_better: bool = True) -> pd.Series:
+    """Return a 0-100 percentile score where higher values always mean better.
+
+    When higher_better=True, the largest raw value receives the highest score.
+    When higher_better=False, the smallest raw value receives the highest score.
+    This function is used by Productivity, Opportunity, Risk, Clone, and Macro scores,
+    so keeping the direction intuitive is critical for the dashboard.
+    """
     s = pd.to_numeric(s, errors="coerce")
     if s.notna().sum() <= 1:
         return pd.Series(np.where(s.notna(), 50.0, np.nan), index=s.index)
-    return s.rank(pct=True, ascending=not higher_better) * 100
+    return s.rank(pct=True, ascending=higher_better) * 100
 
 
 def deterministic_jitter(n: int, seed_key: str, scale_lat: float = 1.25, scale_lon: float = 1.65) -> np.ndarray:
