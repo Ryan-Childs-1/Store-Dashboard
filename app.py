@@ -1135,10 +1135,10 @@ with map_col:
                 clicked_state = cd[0]
                 st.success(f"Map selected: {ABBR_STATE.get(clicked_state, clicked_state)}. Use the sidebar state drilldown to lock this view.")
     except TypeError:
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="plotly_chart_1138")
         st.caption("Your Streamlit version does not expose Plotly click selections. Use the sidebar state drilldown to inspect each state.")
 with loc_col:
-    st.plotly_chart(store_location_map(scope, f"Store Locations — {selected_label}"), use_container_width=True)
+    st.plotly_chart(store_location_map(scope, f"Store Locations — {selected_label}"), use_container_width=True, key="plotly_chart_1141")
 
 st.markdown("---")
 
@@ -1189,10 +1189,10 @@ with tabs[0]:
     c1, c2 = st.columns(2)
     with c1:
         top_states = summary[summary["Store_Count"].gt(0)].sort_values("Volume_2024", ascending=False)
-        st.plotly_chart(bar_chart(top_states, "State", "Volume_2024", "States by 2024 Volume"), use_container_width=True)
+        st.plotly_chart(bar_chart(top_states, "State", "Volume_2024", "States by 2024 Volume"), use_container_width=True, key="plotly_chart_1192")
     with c2:
         state_eff = summary[summary["Store_Count"].gt(0)].sort_values("Revenue_per_SqFt", ascending=False)
-        st.plotly_chart(bar_chart(state_eff, "State", "Revenue_per_SqFt", "States by Weighted Revenue / Sq. Ft."), use_container_width=True)
+        st.plotly_chart(bar_chart(state_eff, "State", "Revenue_per_SqFt", "States by Weighted Revenue / Sq. Ft."), use_container_width=True, key="plotly_chart_1195")
 
     st.markdown("#### Automatically surfaced findings")
     finding_rows = []
@@ -1236,12 +1236,12 @@ with tabs[1]:
     c1, c2 = st.columns(2)
     state_eff = summary[summary["Store_Count"].gt(0)].sort_values("Revenue_per_SqFt", ascending=False)
     with c1:
-        st.plotly_chart(bar_chart(state_eff, "State", "Revenue_per_SqFt", "States by Weighted Revenue / Sq. Ft."), use_container_width=True)
+        st.plotly_chart(bar_chart(state_eff, "State", "Revenue_per_SqFt", "States by Weighted Revenue / Sq. Ft."), use_container_width=True, key="plotly_chart_1239")
     with c2:
         if "Revenue per Sq. Ft." in scope.columns:
             fig = px.scatter(scope, x="Sq. Footage", y="Revenue per Sq. Ft.", size="24 Volume Dollars", color="State Abbr", hover_name="Store Number - Name", title="Footprint vs Productivity")
             fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10), yaxis_tickprefix="$")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="plotly_chart_1244")
     cols = safe_col_list(scope, ["Store Number - Name", "City", "State", "Size Band", "24 Volume Dollars", "Sq. Footage", "Revenue per Sq. Ft.", "Store Diagnostic"])
     display_df(scope[cols].sort_values("Revenue per Sq. Ft.", ascending=False), money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], height=430)
 
@@ -1251,10 +1251,10 @@ with tabs[2]:
     st.info("This view focuses on actual measured growth/decline. New stores with missing older history should be interpreted separately from mature stores.")
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(trend_chart(scope, f"Volume Trend — {selected_label}"), use_container_width=True)
+        st.plotly_chart(trend_chart(scope, f"Volume Trend — {selected_label}"), use_container_width=True, key="plotly_chart_1254")
     with c2:
         state_risk = summary[summary["Store_Count"].gt(0)].sort_values("Risk_Score", ascending=False)
-        st.plotly_chart(bar_chart(state_risk, "State", "Risk_Score", "Highest State Risk Scores"), use_container_width=True)
+        st.plotly_chart(bar_chart(state_risk, "State", "Risk_Score", "Highest State Risk Scores"), use_container_width=True, key="plotly_chart_1257")
     risk_cols = safe_col_list(summary, ["State", "Store_Count", "Volume_2024", "Growth_24_vs_23", "CAGR_21_24", "Revenue_per_SqFt", "Risk_Score"])
     display_df(summary[summary["Store_Count"].gt(0)].sort_values("Risk_Score", ascending=False)[risk_cols], money_cols=["Volume_2024", "Revenue_per_SqFt"], pct_cols=["Growth_24_vs_23", "CAGR_21_24"], height=320)
     st.markdown("#### Store decline table")
@@ -1273,11 +1273,11 @@ with tabs[3]:
         band["Weighted_RevSqFt"] = band["Volume_2024"] / band["SqFt"].replace(0, np.nan)
         c1, c2 = st.columns(2)
         with c1:
-            st.plotly_chart(bar_chart(band.sort_values("Weighted_RevSqFt", ascending=False), "Size Band", "Weighted_RevSqFt", "Weighted Revenue / Sq. Ft. by Size Band"), use_container_width=True)
+            st.plotly_chart(bar_chart(band.sort_values("Weighted_RevSqFt", ascending=False), "Size Band", "Weighted_RevSqFt", "Weighted Revenue / Sq. Ft. by Size Band"), use_container_width=True, key="plotly_chart_1276")
         with c2:
             fig = px.box(scope, x="Size Band", y="Revenue per Sq. Ft.", points="all", title="Store Productivity Distribution by Size Band")
             fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10), yaxis_tickprefix="$")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="plotly_chart_1280")
         display_df(band.sort_values("Weighted_RevSqFt", ascending=False), money_cols=["Volume_2024", "Avg_RevSqFt", "Weighted_RevSqFt"], pct_cols=["Avg_Growth"], height=300)
     st.markdown("#### Large footprint risk and compact outperformers")
     c3, c4 = st.columns(2)
@@ -1302,9 +1302,9 @@ with tabs[4]:
         ).reset_index()
         c1, c2 = st.columns(2)
         with c1:
-            st.plotly_chart(bar_chart(cohort, "Maturity Band", "Avg_RevSqFt", "Revenue / Sq. Ft. by Maturity Cohort"), use_container_width=True)
+            st.plotly_chart(bar_chart(cohort, "Maturity Band", "Avg_RevSqFt", "Revenue / Sq. Ft. by Maturity Cohort"), use_container_width=True, key="plotly_chart_1305")
         with c2:
-            st.plotly_chart(bar_chart(cohort, "Maturity Band", "Avg_YoY", "Latest YoY Growth by Maturity Cohort"), use_container_width=True)
+            st.plotly_chart(bar_chart(cohort, "Maturity Band", "Avg_YoY", "Latest YoY Growth by Maturity Cohort"), use_container_width=True, key="plotly_chart_1307")
         display_df(cohort, money_cols=["Volume_2024", "Avg_RevSqFt"], pct_cols=["Avg_YoY", "Avg_CAGR"], height=300)
     cols = safe_col_list(scope, ["Store Number - Name", "State", "Grand Opening Year", "Store Age", "Maturity Band", "24 Volume Dollars", "Revenue per Sq. Ft.", "YoY Growth 24 vs 23", "CAGR 21-24"])
     display_df(scope.sort_values("Store Age", ascending=True)[cols], money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], pct_cols=["YoY Growth 24 vs 23", "CAGR 21-24"], height=380)
@@ -1316,11 +1316,11 @@ with tabs[5]:
     ws = summary[summary["Store_Count"].gt(0)].sort_values("White_Space_Score", ascending=False)
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(bar_chart(ws, "State", "White_Space_Score", "White Space Score"), use_container_width=True)
+        st.plotly_chart(bar_chart(ws, "State", "White_Space_Score", "White Space Score"), use_container_width=True, key="plotly_chart_1319")
     with c2:
         fig = px.scatter(ws, x="Stores_per_1M_People", y="Retail_GDP_per_Store_Millions", size="Population 2024", color="White_Space_Score", hover_name="State", title="Store Density vs Retail GDP per Store")
         fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="plotly_chart_1323")
     cols = safe_col_list(ws, ["State", "Store_Count", "Population 2024", "Stores_per_1M_People", "Retail_GDP_per_Store_Millions", "Outdoor_Macro_per_Store_Millions", "Revenue_per_Capita", "White_Space_Score", "Outdoor_Fit_Status"])
     display_df(ws[cols], money_cols=["Revenue_per_Capita"], height=430)
 
@@ -1334,11 +1334,11 @@ with tabs[6]:
     fit = summary[summary["Store_Count"].gt(0)].sort_values("Outdoor_Retail_Macro_Score", ascending=False)
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(bar_chart(fit, "State", "Outdoor_Retail_Macro_Score", "Outdoor Retail Macro Score"), use_container_width=True)
+        st.plotly_chart(bar_chart(fit, "State", "Outdoor_Retail_Macro_Score", "Outdoor Retail Macro Score"), use_container_width=True, key="plotly_chart_1337")
     with c2:
         fig = px.scatter(fit, x="Outdoor_Retail_Macro_Score", y="Revenue_per_Capita", size="Store_Count", color="Outdoor_Fit_Status", hover_name="State", title="Macro Fit vs Current Revenue / Capita")
         fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10), yaxis_tickprefix="$")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="plotly_chart_1341")
     cols = safe_col_list(fit, ["State", "Store_Count", "Outdoor_Retail_Macro_Score", "Outdoor_Fit_Status", "Retail_GDP_per_Capita", "Retail trade", "Accommodation and food services", "Arts, entertainment, and recreation", "Agriculture, forestry, fishing and hunting", "Natural resources and mining"])
     display_df(fit[cols], money_cols=["Retail_GDP_per_Capita"], height=430)
 
@@ -1349,9 +1349,9 @@ with tabs[7]:
     pen = summary[summary["Store_Count"].gt(0)].copy()
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(bar_chart(pen.sort_values("Market_Penetration_Retail_GDP", ascending=False), "State", "Market_Penetration_Retail_GDP", "Store Revenue / Retail GDP"), use_container_width=True)
+        st.plotly_chart(bar_chart(pen.sort_values("Market_Penetration_Retail_GDP", ascending=False), "State", "Market_Penetration_Retail_GDP", "Store Revenue / Retail GDP"), use_container_width=True, key="plotly_chart_1352")
     with c2:
-        st.plotly_chart(bar_chart(pen.sort_values("Outdoor_Market_Penetration", ascending=False), "State", "Outdoor_Market_Penetration", "Store Revenue / Outdoor Macro GDP"), use_container_width=True)
+        st.plotly_chart(bar_chart(pen.sort_values("Outdoor_Market_Penetration", ascending=False), "State", "Outdoor_Market_Penetration", "Store Revenue / Outdoor Macro GDP"), use_container_width=True, key="plotly_chart_1354")
     cols = safe_col_list(pen, ["State", "Store_Count", "Volume_2024", "Revenue_per_Capita", "Market_Penetration_Retail_GDP", "Outdoor_Market_Penetration", "Retail_GDP_per_Store_Millions", "Outdoor_Macro_per_Store_Millions"])
     display_df(pen.sort_values("Market_Penetration_Retail_GDP", ascending=False)[cols], money_cols=["Volume_2024", "Revenue_per_Capita"], pct_cols=["Market_Penetration_Retail_GDP", "Outdoor_Market_Penetration"], height=430)
 
@@ -1361,11 +1361,11 @@ with tabs[8]:
     st.info("The default index blends revenue per square foot, 2024 volume, measured growth, and stability. It is designed to find productive stores, not just large ones.")
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(bar_chart(scope.sort_values("Productivity Index", ascending=False), "Productivity Index", "Store Number - Name", "Store Productivity Leaders", "h"), use_container_width=True)
+        st.plotly_chart(bar_chart(scope.sort_values("Productivity Index", ascending=False), "Productivity Index", "Store Number - Name", "Store Productivity Leaders", "h"), use_container_width=True, key="plotly_chart_1364")
     with c2:
         if "Productivity Band" in scope.columns:
             band = scope.groupby("Productivity Band", dropna=False).agg(Stores=("State", "count"), Volume_2024=("24 Volume Dollars", "sum"), Avg_RevSqFt=("Revenue per Sq. Ft.", "mean")).reset_index()
-            st.plotly_chart(bar_chart(band, "Productivity Band", "Stores", "Stores by Productivity Band"), use_container_width=True)
+            st.plotly_chart(bar_chart(band, "Productivity Band", "Stores", "Stores by Productivity Band"), use_container_width=True, key="plotly_chart_1368")
     cols = safe_col_list(scope, ["Store Number - Name", "City", "State", "24 Volume Dollars", "Revenue per Sq. Ft.", "CAGR 21-24", "Stability Score", "Productivity Index", "Productivity Band", "Store Archetype"])
     display_df(scope.sort_values("Productivity Index", ascending=False)[cols], money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], pct_cols=["CAGR 21-24"], height=430)
 
@@ -1387,9 +1387,9 @@ with tabs[9]:
     if not flag_df.empty:
         c1,c2=st.columns(2)
         with c1:
-            st.plotly_chart(bar_chart(flag_df, "Flag", "Flagged Stores", "Flag Store Counts"), use_container_width=True)
+            st.plotly_chart(bar_chart(flag_df, "Flag", "Flagged Stores", "Flag Store Counts"), use_container_width=True, key="plotly_chart_1390")
         with c2:
-            st.plotly_chart(bar_chart(flag_df.sort_values("Rev/SqFt Lift vs All", ascending=False), "Flag", "Rev/SqFt Lift vs All", "Revenue / SqFt Lift vs All Stores"), use_container_width=True)
+            st.plotly_chart(bar_chart(flag_df.sort_values("Rev/SqFt Lift vs All", ascending=False), "Flag", "Rev/SqFt Lift vs All", "Revenue / SqFt Lift vs All Stores"), use_container_width=True, key="plotly_chart_1392")
         display_df(flag_df, money_cols=["Avg Volume Flagged","Avg Volume Non-Flagged","Avg Rev/SqFt Flagged"], pct_cols=["Share of Stores","Volume Lift vs All","Rev/SqFt Lift vs All","Avg Growth Flagged"], height=430)
 
 # 11 Store Archetypes
@@ -1400,9 +1400,9 @@ with tabs[10]:
         arch = scope.groupby("Store Archetype", dropna=False).agg(Stores=("State", "count"), Volume_2024=("24 Volume Dollars", "sum"), Avg_RevSqFt=("Revenue per Sq. Ft.", "mean"), Avg_Growth=("YoY Growth 24 vs 23", "mean"), Avg_Productivity=("Productivity Index", "mean")).reset_index().sort_values("Avg_Productivity", ascending=False)
         c1,c2=st.columns(2)
         with c1:
-            st.plotly_chart(bar_chart(arch, "Store Archetype", "Avg_Productivity", "Average Productivity by Archetype"), use_container_width=True)
+            st.plotly_chart(bar_chart(arch, "Store Archetype", "Avg_Productivity", "Average Productivity by Archetype"), use_container_width=True, key="plotly_chart_1403")
         with c2:
-            st.plotly_chart(bar_chart(arch, "Store Archetype", "Avg_RevSqFt", "Revenue / Sq. Ft. by Archetype"), use_container_width=True)
+            st.plotly_chart(bar_chart(arch, "Store Archetype", "Avg_RevSqFt", "Revenue / Sq. Ft. by Archetype"), use_container_width=True, key="plotly_chart_1405")
         display_df(arch, money_cols=["Volume_2024","Avg_RevSqFt"], pct_cols=["Avg_Growth"], height=300)
     cols=safe_col_list(scope,["Store Number - Name","State","Size Band","Maturity Band","Store Archetype","24 Volume Dollars","Revenue per Sq. Ft.","Productivity Index","Store Diagnostic"])
     display_df(scope.sort_values("Store Archetype")[cols], money_cols=["24 Volume Dollars","Revenue per Sq. Ft."], height=380)
@@ -1421,11 +1421,11 @@ with tabs[11]:
     )
     c1,c2=st.columns(2)
     with c1:
-        st.plotly_chart(bar_chart(clone.sort_values("Clone Score", ascending=False), "Clone Score", "Store Number - Name", "Clone Score Leaders", "h"), use_container_width=True)
+        st.plotly_chart(bar_chart(clone.sort_values("Clone Score", ascending=False), "Clone Score", "Store Number - Name", "Clone Score Leaders", "h"), use_container_width=True, key="plotly_chart_1424")
     with c2:
         fig=px.scatter(clone, x="Revenue per Sq. Ft.", y="YoY Growth 24 vs 23", size="24 Volume Dollars", color="Store Archetype", hover_name="Store Number - Name", title="Efficiency + Momentum Best-Practice Map")
         fig.update_layout(height=420, margin=dict(l=10,r=10,t=50,b=10), xaxis_tickprefix="$", yaxis_tickformat=".1%")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="plotly_chart_1428")
     cols=safe_col_list(clone,["Store Number - Name","City","State","Store Archetype","24 Volume Dollars","Revenue per Sq. Ft.","YoY Growth 24 vs 23","Stability Score","Productivity Index","Clone Score"])
     display_df(clone.sort_values("Clone Score", ascending=False)[cols], money_cols=["24 Volume Dollars","Revenue per Sq. Ft."], pct_cols=["YoY Growth 24 vs 23"], height=430)
 
@@ -1437,12 +1437,12 @@ with tabs[12]:
     diag["Diagnostic Severity"] = rank_pct(-diag.get("Rev/SqFt Gap %", pd.Series(np.nan, index=diag.index)), True).fillna(50)
     c1,c2=st.columns(2)
     with c1:
-        st.plotly_chart(bar_chart(diag.sort_values("Diagnostic Severity", ascending=False), "Diagnostic Severity", "Store Number - Name", "Largest Underperformance Gaps", "h"), use_container_width=True)
+        st.plotly_chart(bar_chart(diag.sort_values("Diagnostic Severity", ascending=False), "Diagnostic Severity", "Store Number - Name", "Largest Underperformance Gaps", "h"), use_container_width=True, key="plotly_chart_1440")
     with c2:
         fig=px.scatter(diag, x="Peer Expected Rev/SqFt", y="Revenue per Sq. Ft.", color="Store Diagnostic", size="24 Volume Dollars", hover_name="Store Number - Name", title="Actual vs Peer-Expected Revenue / Sq. Ft.")
         fig.add_trace(go.Scatter(x=[diag["Peer Expected Rev/SqFt"].min(), diag["Peer Expected Rev/SqFt"].max()], y=[diag["Peer Expected Rev/SqFt"].min(), diag["Peer Expected Rev/SqFt"].max()], mode="lines", name="Expected line"))
         fig.update_layout(height=420, margin=dict(l=10,r=10,t=50,b=10), xaxis_tickprefix="$", yaxis_tickprefix="$")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="plotly_chart_1445")
     cols=safe_col_list(diag,["Store Number - Name","State","Size Band","Maturity Band","24 Volume Dollars","Revenue per Sq. Ft.","Peer Expected Rev/SqFt","Rev/SqFt Gap %","Store Diagnostic","State Risk_Score"])
     display_df(diag.sort_values("Diagnostic Severity", ascending=False)[cols], money_cols=["24 Volume Dollars","Revenue per Sq. Ft.","Peer Expected Rev/SqFt"], pct_cols=["Rev/SqFt Gap %"], height=430)
 
@@ -1486,11 +1486,11 @@ with tabs[13]:
             fig.add_trace(go.Scatter(x=national_proj["Year"], y=national_proj["Low Case Volume"], mode="lines", name="Low", fill="tonexty", line=dict(width=0), fillcolor="rgba(128,128,128,.22)", showlegend=False))
             fig.add_trace(go.Scatter(x=national_proj["Year"], y=national_proj["Projected Volume"], mode="lines+markers", name="Base Projection"))
             fig.update_layout(title=f"Projected Volume Path — {scenario}", height=430, margin=dict(l=10,r=10,t=50,b=10), yaxis_tickprefix="$")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="plotly_chart_1489")
     with c2:
         rank_states = state_model_view.sort_values(f"Projected_{target_year}_Change", ascending=False)
         if not rank_states.empty:
-            st.plotly_chart(bar_chart(rank_states, "State", f"Projected_{target_year}_Change", f"Projected Volume Change by {target_year}"), use_container_width=True)
+            st.plotly_chart(bar_chart(rank_states, "State", f"Projected_{target_year}_Change", f"Projected Volume Change by {target_year}"), use_container_width=True, key="plotly_chart_1493")
     state_cols=safe_col_list(state_model_view,["State","State Abbr","Store_Count","Volume_2024",f"Projected_{target_year}_Volume",f"Projected_{target_year}_Change","Projected_Growth_Rate","Macro_Growth_Signal","Population_Growth_23_24","GDP_CAGR_10Y","CAGR_21_24","Growth_24_vs_23","Stores_per_1M_People","Revenue_per_Capita","Model_Confidence","Uncertainty"])
     st.markdown("#### State projection table")
     display_df(state_model_view[state_cols].sort_values(f"Projected_{target_year}_Change", ascending=False), money_cols=["Volume_2024",f"Projected_{target_year}_Volume",f"Projected_{target_year}_Change","Revenue_per_Capita"], pct_cols=["Projected_Growth_Rate","Macro_Growth_Signal","Population_Growth_23_24","GDP_CAGR_10Y","CAGR_21_24","Growth_24_vs_23","Uncertainty"], height=360)
@@ -1507,8 +1507,8 @@ with tabs[14]:
     st.info("Stability helps separate reliable stores from stores with large year-to-year swings.")
     c1,c2=st.columns(2)
     with c1:
-        st.plotly_chart(bar_chart(scope.sort_values("Stability Score", ascending=False), "Stability Score", "Store Number - Name", "Most Stable Stores", "h"), use_container_width=True)
+        st.plotly_chart(bar_chart(scope.sort_values("Stability Score", ascending=False), "Stability Score", "Store Number - Name", "Most Stable Stores", "h"), use_container_width=True, key="plotly_chart_1510")
     with c2:
-        st.plotly_chart(bar_chart(scope.sort_values("Stability Score", ascending=True), "Stability Score", "Store Number - Name", "Most Volatile Stores", "h"), use_container_width=True)
+        st.plotly_chart(bar_chart(scope.sort_values("Stability Score", ascending=True), "Stability Score", "Store Number - Name", "Most Volatile Stores", "h"), use_container_width=True, key="plotly_chart_1512")
     cols=safe_col_list(scope,["Store Number - Name","State","21 Volume Dollars","22 Volume Dollars","23 Volume Dollars","24 Volume Dollars","Volume CV","Stability Score","Productivity Index"])
     display_df(scope.sort_values("Stability Score", ascending=False)[cols], money_cols=["21 Volume Dollars","22 Volume Dollars","23 Volume Dollars","24 Volume Dollars"], height=430)
