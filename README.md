@@ -65,3 +65,10 @@ The model:
 5. Produces state-level and store-level projections with low/base/high uncertainty bands.
 
 This keeps the model useful on GitHub and Streamlit Cloud without requiring TensorFlow, PyTorch, or scikit-learn.
+
+## Latest interaction upgrades
+
+- Removed the table/chart row-limit slider entirely. Tables and charts now include every row that passes the active filters.
+- Added global filters in the sidebar that apply to the map, drilldown, side metrics, and all 10 tabs.
+- Added always-visible sidebar metrics for the current filtered/drilldown view.
+- Added useful filter controls for region, size band, volume band, red/blue, pick day, maturity, productivity band, numeric ranges, category/market flags, and search.

@@ -423,22 +423,141 @@ def scope_data(stores: pd.DataFrame, selected_state: str) -> pd.DataFrame:
 
 def state_row(summary: pd.DataFrame, selected_state: str) -> pd.Series:
     if selected_state == "ALL":
+        active = summary[summary["Store_Count"].fillna(0).gt(0)].copy()
+        if active.empty:
+            active = summary.copy()
+        active_pop = active["Population 2024"].sum(skipna=True) if "Population 2024" in active.columns else np.nan
+        active_gdp = active["GDP_2020_Millions"].sum(skipna=True) if "GDP_2020_Millions" in active.columns else np.nan
         return pd.Series({
             "State": "United States",
             "State Abbr": "ALL",
-            "Store_Count": summary["Store_Count"].sum(),
-            "Total_Sq_Footage": summary["Total_Sq_Footage"].sum(),
-            "Volume_2024": summary["Volume_2024"].sum(),
-            "Volume_2023": summary["Volume_2023"].sum(),
-            "Population 2024": summary["Population 2024"].sum(skipna=True),
-            "GDP_2020_Millions": summary["GDP_2020_Millions"].sum(skipna=True),
-            "Revenue_per_SqFt": summary["Volume_2024"].sum() / summary["Total_Sq_Footage"].sum() if summary["Total_Sq_Footage"].sum() else np.nan,
-            "Growth_24_vs_23": (summary["Volume_2024"].sum() - summary["Volume_2023"].sum()) / summary["Volume_2023"].sum() if summary["Volume_2023"].sum() else np.nan,
-            "Stores_per_1M_People": summary["Store_Count"].sum() / (summary["Population 2024"].sum(skipna=True) / 1_000_000) if summary["Population 2024"].sum(skipna=True) else np.nan,
-            "Revenue_per_Capita": summary["Volume_2024"].sum() / summary["Population 2024"].sum(skipna=True) if summary["Population 2024"].sum(skipna=True) else np.nan,
+            "Store_Count": active["Store_Count"].sum(),
+            "Total_Sq_Footage": active["Total_Sq_Footage"].sum(),
+            "Volume_2024": active["Volume_2024"].sum(),
+            "Volume_2023": active["Volume_2023"].sum(),
+            "Population 2024": active_pop,
+            "GDP_2020_Millions": active_gdp,
+            "Revenue_per_SqFt": active["Volume_2024"].sum() / active["Total_Sq_Footage"].sum() if active["Total_Sq_Footage"].sum() else np.nan,
+            "Growth_24_vs_23": (active["Volume_2024"].sum() - active["Volume_2023"].sum()) / active["Volume_2023"].sum() if active["Volume_2023"].sum() else np.nan,
+            "Stores_per_1M_People": active["Store_Count"].sum() / (active_pop / 1_000_000) if pd.notna(active_pop) and active_pop else np.nan,
+            "Revenue_per_Capita": active["Volume_2024"].sum() / active_pop if pd.notna(active_pop) and active_pop else np.nan,
         })
     hit = summary[summary["State Abbr"].eq(selected_state)]
     return hit.iloc[0] if not hit.empty else pd.Series(dtype=object)
+
+
+
+def _sorted_clean_options(df: pd.DataFrame, col: str) -> List[str]:
+    if col not in df.columns:
+        return []
+    vals = df[col].dropna().map(clean_text)
+    vals = vals[vals.ne("") & vals.ne("-")]
+    return sorted(vals.unique().tolist())
+
+
+def _filter_multiselect(df: pd.DataFrame, col: str, selected: List[str]) -> pd.DataFrame:
+    if not selected or col not in df.columns:
+        return df
+    return df[df[col].map(clean_text).isin(selected)].copy()
+
+
+def render_global_filters(stores_all: pd.DataFrame) -> pd.DataFrame:
+    """Sidebar controls that filter the store dataset before every tab is built."""
+    filtered = stores_all.copy()
+    with st.sidebar:
+        st.markdown("---")
+        st.header("Global Filters")
+        st.caption("These filters apply to the map, state drilldown, side metrics, and every tab.")
+
+        search = st.text_input("Search store / city / address", value="", placeholder="Provo, 102, Utah, address...")
+        if search.strip():
+            q = search.strip().lower()
+            search_cols = [c for c in ["Store Number - Name", "City", "Address", "CityStateZip", "State"] if c in filtered.columns]
+            if search_cols:
+                mask = pd.Series(False, index=filtered.index)
+                for c in search_cols:
+                    mask = mask | filtered[c].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                filtered = filtered[mask].copy()
+
+        for col, label in [
+            ("Region", "Region"),
+            ("Size Band", "Size band"),
+            ("Volume Band", "Volume band"),
+            ("Red/Blue", "Red / Blue"),
+            ("Pick Day", "Pick day"),
+            ("Maturity Band", "Store maturity"),
+            ("Productivity Band", "Productivity band"),
+        ]:
+            opts = _sorted_clean_options(filtered, col)
+            if opts:
+                chosen = st.multiselect(label, opts, default=[])
+                filtered = _filter_multiselect(filtered, col, chosen)
+
+        numeric_filters = []
+        if "24 Volume Dollars" in filtered.columns and filtered["24 Volume Dollars"].notna().any():
+            numeric_filters.append(("24 Volume Dollars", "2024 volume"))
+        if "Revenue per Sq. Ft." in filtered.columns and filtered["Revenue per Sq. Ft."].notna().any():
+            numeric_filters.append(("Revenue per Sq. Ft.", "Revenue / sq. ft."))
+        if "Sq. Footage" in filtered.columns and filtered["Sq. Footage"].notna().any():
+            numeric_filters.append(("Sq. Footage", "Square footage"))
+        if "CAGR 21-24" in filtered.columns and filtered["CAGR 21-24"].notna().any():
+            numeric_filters.append(("CAGR 21-24", "2021-2024 CAGR"))
+
+        with st.expander("Numeric filters", expanded=False):
+            for col, label in numeric_filters:
+                lo = float(pd.to_numeric(filtered[col], errors="coerce").min())
+                hi = float(pd.to_numeric(filtered[col], errors="coerce").max())
+                if pd.notna(lo) and pd.notna(hi) and lo < hi:
+                    sel = st.slider(label, min_value=lo, max_value=hi, value=(lo, hi), key=f"filter_{col}")
+                    filtered = filtered[pd.to_numeric(filtered[col], errors="coerce").between(sel[0], sel[1], inclusive="both")].copy()
+
+        available_flags = [f for f in FLAG_COLUMNS if f + " Flag" in filtered.columns]
+        if available_flags:
+            with st.expander("Category / market flag filters", expanded=False):
+                include_flags = st.multiselect("Require these flags", available_flags, default=[])
+                exclude_flags = st.multiselect("Exclude these flags", available_flags, default=[])
+                mode = st.radio("Flag matching mode", ["All selected flags", "Any selected flag"], horizontal=False)
+                if include_flags:
+                    cols = [f + " Flag" for f in include_flags]
+                    mask = filtered[cols].any(axis=1) if mode == "Any selected flag" else filtered[cols].all(axis=1)
+                    filtered = filtered[mask].copy()
+                if exclude_flags:
+                    cols = [f + " Flag" for f in exclude_flags]
+                    filtered = filtered[~filtered[cols].any(axis=1)].copy()
+
+        sort_options = [c for c in [
+            "24 Volume Dollars", "Revenue per Sq. Ft.", "YoY Growth 24 vs 23", "CAGR 21-24",
+            "Productivity Index", "Stability Score", "Sq. Footage", "Store Age",
+        ] if c in filtered.columns]
+        if sort_options:
+            sort_col = st.selectbox("Default store-table sort", sort_options, index=0)
+            sort_dir = st.radio("Sort direction", ["High to low", "Low to high"], horizontal=True)
+            filtered = filtered.sort_values(sort_col, ascending=(sort_dir == "Low to high"), na_position="last").copy()
+
+    return filtered
+
+
+def render_sidebar_metrics(scope_df: pd.DataFrame, summary_df: pd.DataFrame, selected_state: str) -> None:
+    """Always-visible side KPI panel tied to the active filters and drilldown."""
+    r = state_row(summary_df, selected_state)
+    vol_2024 = scope_df["24 Volume Dollars"].sum() if "24 Volume Dollars" in scope_df.columns else np.nan
+    vol_2023 = scope_df["23 Volume Dollars"].sum() if "23 Volume Dollars" in scope_df.columns else np.nan
+    rev_sqft = vol_2024 / scope_df["Sq. Footage"].sum() if "Sq. Footage" in scope_df.columns and scope_df["Sq. Footage"].sum() else np.nan
+    growth = (vol_2024 - vol_2023) / vol_2023 if pd.notna(vol_2023) and vol_2023 else np.nan
+    with st.sidebar:
+        st.markdown("---")
+        st.header("Side Metrics")
+        st.caption("Current filters + current drilldown.")
+        st.metric("Stores", fmt_num(len(scope_df)))
+        st.metric("2024 Volume", fmt_money(vol_2024))
+        st.metric("Revenue / Sq. Ft.", fmt_money(rev_sqft))
+        st.metric("24 vs 23 Growth", fmt_pct(growth))
+        st.metric("Stores / 1M Pop.", fmt_float(r.get("Stores_per_1M_People", np.nan), 2))
+        st.metric("Revenue / Capita", fmt_money(r.get("Revenue_per_Capita", np.nan)))
+        if "Productivity Index" in scope_df.columns:
+            st.metric("Avg Productivity", fmt_float(scope_df["Productivity Index"].mean(), 1))
+        if "Stability Score" in scope_df.columns:
+            st.metric("Avg Stability", fmt_float(scope_df["Stability Score"].mean(), 1))
 
 
 # -----------------------------
@@ -773,7 +892,7 @@ with st.sidebar:
         ],
         index=0,
     )
-    top_n = st.slider("Table/chart row limit", 5, 50, 15, 5)
+    st.caption("Tables and charts are uncapped: every row passing the global filters is included.")
 
 if uploaded is None:
     st.info("Upload `Store List v1.csv` in the sidebar to launch the dashboard. The population and GDP files are already bundled in this GitHub project folder.")
@@ -792,10 +911,15 @@ if uploaded is None:
 
 try:
     raw_stores = read_uploaded_store_file(uploaded)
-    stores = normalize_store_df(raw_stores)
-    stores = add_store_productivity_scores(stores)
+    stores_all = normalize_store_df(raw_stores)
+    stores_all = add_store_productivity_scores(stores_all)
 except Exception as e:
     st.error(f"Could not process the uploaded store file: {e}")
+    st.stop()
+
+stores = render_global_filters(stores_all)
+if stores.empty:
+    st.warning("No stores match the current global filters. Clear one or more filters in the sidebar to continue.")
     st.stop()
 
 summary = build_state_summary(stores, pop, gdp)
@@ -811,6 +935,7 @@ with st.sidebar:
 scope = scope_data(stores, selected_state)
 selected_label = "United States" if selected_state == "ALL" else ABBR_STATE.get(selected_state, selected_state)
 row = state_row(summary, selected_state)
+render_sidebar_metrics(scope, summary, selected_state)
 
 # -----------------------------
 # Top KPI strip
@@ -870,11 +995,11 @@ with tabs[0]:
     c1, c2 = st.columns(2)
     state_eff = summary[summary["Store_Count"].gt(0)].sort_values("Revenue_per_SqFt", ascending=False)
     with c1:
-        st.plotly_chart(bar_chart(state_eff.head(top_n), "State", "Revenue_per_SqFt", "Top States by Revenue / Sq. Ft."), use_container_width=True)
+        st.plotly_chart(bar_chart(state_eff, "State", "Revenue_per_SqFt", "Top States by Revenue / Sq. Ft."), use_container_width=True)
     with c2:
         if "Revenue per Sq. Ft." in scope.columns:
             store_eff = scope.sort_values("Revenue per Sq. Ft.", ascending=False)
-            st.plotly_chart(bar_chart(store_eff.head(top_n), "Revenue per Sq. Ft.", "Store Number - Name", "Top Stores by Revenue / Sq. Ft.", "h"), use_container_width=True)
+            st.plotly_chart(bar_chart(store_eff, "Revenue per Sq. Ft.", "Store Number - Name", "Top Stores by Revenue / Sq. Ft.", "h"), use_container_width=True)
     cols = [c for c in ["Store Number - Name", "City", "State", "24 Volume Dollars", "Sq. Footage", "Revenue per Sq. Ft.", "Volume Band"] if c in scope.columns]
     display_df(scope[cols].sort_values("Revenue per Sq. Ft.", ascending=False), money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], height=390)
 
@@ -887,7 +1012,7 @@ with tabs[1]:
         st.plotly_chart(trend_chart(scope, f"Volume Trend — {selected_label}"), use_container_width=True)
     with c2:
         growth_state = summary[summary["Store_Count"].gt(0)].sort_values("Growth_24_vs_23", ascending=False)
-        st.plotly_chart(bar_chart(growth_state.head(top_n), "State", "Growth_24_vs_23", "Best 24 vs 23 Growth by State"), use_container_width=True)
+        st.plotly_chart(bar_chart(growth_state, "State", "Growth_24_vs_23", "Best 24 vs 23 Growth by State"), use_container_width=True)
     growth_cols = [c for c in ["Store Number - Name", "City", "State", "21 Volume Dollars", "22 Volume Dollars", "23 Volume Dollars", "24 Volume Dollars", "YoY Growth 22 vs 21", "YoY Growth 23 vs 22", "YoY Growth 24 vs 23", "CAGR 21-24"] if c in scope.columns]
     display_df(scope[growth_cols].sort_values("YoY Growth 24 vs 23", ascending=False), money_cols=["21 Volume Dollars", "22 Volume Dollars", "23 Volume Dollars", "24 Volume Dollars"], pct_cols=["YoY Growth 22 vs 21", "YoY Growth 23 vs 22", "YoY Growth 24 vs 23", "CAGR 21-24"], height=410)
 
@@ -898,9 +1023,9 @@ with tabs[2]:
     c1, c2 = st.columns(2)
     density_df = summary[summary["Store_Count"].gt(0)].copy()
     with c1:
-        st.plotly_chart(bar_chart(density_df.sort_values("Stores_per_1M_People", ascending=False).head(top_n), "State", "Stores_per_1M_People", "Highest Stores per 1M People"), use_container_width=True)
+        st.plotly_chart(bar_chart(density_df.sort_values("Stores_per_1M_People", ascending=False), "State", "Stores_per_1M_People", "Highest Stores per 1M People"), use_container_width=True)
     with c2:
-        st.plotly_chart(bar_chart(density_df.sort_values("Population_per_Store", ascending=False).head(top_n), "State", "Population_per_Store", "Highest Population per Store"), use_container_width=True)
+        st.plotly_chart(bar_chart(density_df.sort_values("Population_per_Store", ascending=False), "State", "Population_per_Store", "Highest Population per Store"), use_container_width=True)
     density_cols = ["State", "State Abbr", "Store_Count", "Population 2024", "Stores_per_1M_People", "Population_per_Store", "Density (/mile2)"]
     display_df(density_df[density_cols].sort_values("Stores_per_1M_People", ascending=False), height=410)
 
@@ -911,7 +1036,7 @@ with tabs[3]:
     c1, c2 = st.columns(2)
     rpc = summary[summary["Store_Count"].gt(0)].sort_values("Revenue_per_Capita", ascending=False)
     with c1:
-        st.plotly_chart(bar_chart(rpc.head(top_n), "State", "Revenue_per_Capita", "Revenue per Capita by State"), use_container_width=True)
+        st.plotly_chart(bar_chart(rpc, "State", "Revenue_per_Capita", "Revenue per Capita by State"), use_container_width=True)
     with c2:
         fig = px.scatter(rpc, x="Population 2024", y="Revenue_per_Capita", size="Store_Count", hover_name="State", title="Population vs Revenue per Capita")
         fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
@@ -925,7 +1050,7 @@ with tabs[4]:
     c1, c2 = st.columns(2)
     prod = scope.sort_values("Productivity Index", ascending=False)
     with c1:
-        st.plotly_chart(bar_chart(prod.head(top_n), "Productivity Index", "Store Number - Name", "Top Productivity Stores", "h"), use_container_width=True)
+        st.plotly_chart(bar_chart(prod, "Productivity Index", "Store Number - Name", "Top Productivity Stores", "h"), use_container_width=True)
     with c2:
         band_counts = prod["Productivity Band"].value_counts(dropna=False).reset_index()
         band_counts.columns = ["Productivity Band", "Stores"]
@@ -943,9 +1068,9 @@ with tabs[5]:
     stable = scope.sort_values("Stability Score", ascending=False)
     volatile = scope.sort_values("Volume CV", ascending=False)
     with c1:
-        st.plotly_chart(bar_chart(stable.head(top_n), "Stability Score", "Store Number - Name", "Most Stable Stores", "h"), use_container_width=True)
+        st.plotly_chart(bar_chart(stable, "Stability Score", "Store Number - Name", "Most Stable Stores", "h"), use_container_width=True)
     with c2:
-        st.plotly_chart(bar_chart(volatile.head(top_n), "Volume CV", "Store Number - Name", "Most Volatile Stores", "h"), use_container_width=True)
+        st.plotly_chart(bar_chart(volatile, "Volume CV", "Store Number - Name", "Most Volatile Stores", "h"), use_container_width=True)
     stab_cols = [c for c in ["Store Number - Name", "City", "State", "Volume Avg 2021-2024", "Volume Std 2021-2024", "Volume CV", "Stability Score", "24 Volume Dollars"] if c in scope.columns]
     display_df(scope[stab_cols].sort_values("Stability Score", ascending=False), money_cols=["Volume Avg 2021-2024", "Volume Std 2021-2024", "24 Volume Dollars"], height=410)
 
@@ -975,9 +1100,9 @@ with tabs[6]:
     flag_df = pd.DataFrame(rows).sort_values("Flagged Stores", ascending=False)
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(bar_chart(flag_df.head(top_n), "Flag", "Flagged Stores", "Flag Store Counts"), use_container_width=True)
+        st.plotly_chart(bar_chart(flag_df, "Flag", "Flagged Stores", "Flag Store Counts"), use_container_width=True)
     with c2:
-        st.plotly_chart(bar_chart(flag_df.sort_values("Volume Lift vs All", ascending=False).head(top_n), "Flag", "Volume Lift vs All", "Average Volume Lift vs All Stores"), use_container_width=True)
+        st.plotly_chart(bar_chart(flag_df.sort_values("Volume Lift vs All", ascending=False), "Flag", "Volume Lift vs All", "Average Volume Lift vs All Stores"), use_container_width=True)
     display_df(flag_df, money_cols=["Avg Volume Flagged", "Avg Volume Non-Flagged", "Avg Rev/SqFt Flagged"], pct_cols=["Share of Stores", "Volume Lift vs All", "Rev/SqFt Lift vs All", "Avg Growth Flagged"], height=430)
 
 # 8 Market Opportunity
@@ -987,7 +1112,7 @@ with tabs[7]:
     opp = summary[summary["State Abbr"].notna()].copy().sort_values("Opportunity_Score", ascending=False)
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(bar_chart(opp.head(top_n), "State", "Opportunity_Score", "Highest Opportunity States"), use_container_width=True)
+        st.plotly_chart(bar_chart(opp, "State", "Opportunity_Score", "Highest Opportunity States"), use_container_width=True)
     with c2:
         fig = px.scatter(opp, x="Stores_per_1M_People", y="Volume_per_Store", size="Population 2024", color="Opportunity_Score", hover_name="State", title="Store Density vs Revenue per Store")
         fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
@@ -1065,7 +1190,7 @@ with tabs[8]:
         rank_states = state_model_view.sort_values(f"Projected_{target_year}_Change", ascending=False)
         if not rank_states.empty:
             st.plotly_chart(
-                bar_chart(rank_states.head(top_n), "State", f"Projected_{target_year}_Change", f"Largest Projected Volume Gains by {target_year}"),
+                bar_chart(rank_states, "State", f"Projected_{target_year}_Change", f"Largest Projected Volume Gains by {target_year}"),
                 use_container_width=True,
             )
 
