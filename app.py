@@ -538,6 +538,205 @@ def trend_chart(scope_stores: pd.DataFrame, title: str) -> go.Figure:
     return fig
 
 
+
+def winsorize_series(s: pd.Series, lo: float = 0.05, hi: float = 0.95) -> pd.Series:
+    """Clip extreme values while preserving missing values."""
+    s = pd.to_numeric(s, errors="coerce")
+    if s.notna().sum() < 4:
+        return s
+    return s.clip(lower=s.quantile(lo), upper=s.quantile(hi))
+
+
+def ridge_predict(train_df: pd.DataFrame, feature_cols: List[str], target_col: str, score_df: pd.DataFrame, alpha: float = 2.5) -> Tuple[pd.Series, pd.DataFrame]:
+    """Small-sample-safe ridge regression implemented directly with NumPy.
+
+    This avoids adding scikit-learn as a dependency while still creating a real
+    regularized model. Missing features are imputed to the training median.
+    """
+    train = train_df[feature_cols + [target_col]].replace([np.inf, -np.inf], np.nan).copy()
+    train = train.dropna(subset=[target_col])
+    diagnostics = pd.DataFrame(columns=["Feature", "Coefficient"])
+    if len(train) < 4 or len(feature_cols) == 0:
+        fallback = pd.to_numeric(score_df.get(target_col), errors="coerce") if target_col in score_df.columns else pd.Series(np.nan, index=score_df.index)
+        return fallback.fillna(fallback.median() if fallback.notna().any() else 0.0), diagnostics
+
+    med = train[feature_cols].median(numeric_only=True).fillna(0.0)
+    X = train[feature_cols].fillna(med).to_numpy(dtype=float)
+    y = train[target_col].to_numpy(dtype=float)
+    mu = np.nanmean(X, axis=0)
+    sd = np.nanstd(X, axis=0)
+    sd = np.where(sd == 0, 1.0, sd)
+    Xz = (X - mu) / sd
+    X_design = np.c_[np.ones(len(Xz)), Xz]
+
+    # Penalize feature coefficients, not the intercept.
+    penalty = np.eye(X_design.shape[1]) * alpha
+    penalty[0, 0] = 0.0
+    beta = np.linalg.pinv(X_design.T @ X_design + penalty) @ X_design.T @ y
+
+    Xs = score_df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(med).to_numpy(dtype=float)
+    Xsz = (Xs - mu) / sd
+    pred = np.c_[np.ones(len(Xsz)), Xsz] @ beta
+    diagnostics = pd.DataFrame({"Feature": ["Intercept"] + feature_cols, "Coefficient": beta})
+    return pd.Series(pred, index=score_df.index), diagnostics
+
+
+def build_macro_state_features(summary: pd.DataFrame, pop: pd.DataFrame, gdp: pd.DataFrame) -> pd.DataFrame:
+    """Create state-level macro features from bundled population and GDP files."""
+    macro = summary.copy()
+    macro["Population_Growth_23_24"] = macro.get("Growth Rate", np.nan)
+    if "Population 2023" in macro.columns and "Population 2024" in macro.columns:
+        pop_growth_calc = (macro["Population 2024"] - macro["Population 2023"]) / macro["Population 2023"].replace(0, np.nan)
+        macro["Population_Growth_23_24"] = macro["Population_Growth_23_24"].fillna(pop_growth_calc)
+
+    gdp_total = pd.DataFrame()
+    if not gdp.empty and "Description" in gdp.columns:
+        gdp_total = gdp[gdp["Description"].eq("All industry total")].copy()
+    year_cols = sorted([c for c in gdp_total.columns if re.fullmatch(r"\d{4}", str(c))])
+    if not gdp_total.empty and year_cols:
+        rows = []
+        for _, r in gdp_total.iterrows():
+            abbr = r.get("State Abbr")
+            vals = pd.to_numeric(r[year_cols], errors="coerce")
+            valid = vals.dropna()
+            out = {"State Abbr": abbr}
+            if len(valid) >= 2:
+                start_year = int(valid.index[0])
+                end_year = int(valid.index[-1])
+                n = max(end_year - start_year, 1)
+                out["GDP_CAGR_All"] = (valid.iloc[-1] / valid.iloc[0]) ** (1 / n) - 1 if valid.iloc[0] > 0 else np.nan
+            for span in [5, 10, 15]:
+                subset_cols = [c for c in year_cols if int(c) >= int(year_cols[-1]) - span]
+                sub = pd.to_numeric(r[subset_cols], errors="coerce").dropna()
+                if len(sub) >= 2:
+                    n = max(int(sub.index[-1]) - int(sub.index[0]), 1)
+                    out[f"GDP_CAGR_{span}Y"] = (sub.iloc[-1] / sub.iloc[0]) ** (1 / n) - 1 if sub.iloc[0] > 0 else np.nan
+                    out[f"GDP_Volatility_{span}Y"] = sub.pct_change().replace([np.inf, -np.inf], np.nan).std()
+            if len(valid) >= 2:
+                out["GDP_Last_Growth"] = valid.pct_change().replace([np.inf, -np.inf], np.nan).iloc[-1]
+            rows.append(out)
+        gdp_features = pd.DataFrame(rows).dropna(subset=["State Abbr"])
+        macro = macro.merge(gdp_features, on="State Abbr", how="left")
+
+    macro["Macro_Growth_Signal"] = (
+        0.50 * macro.get("GDP_CAGR_10Y", pd.Series(np.nan, index=macro.index)) +
+        0.30 * macro.get("GDP_CAGR_All", pd.Series(np.nan, index=macro.index)) +
+        0.20 * macro.get("Population_Growth_23_24", pd.Series(np.nan, index=macro.index))
+    )
+    return macro
+
+
+def build_growth_projection_model(stores: pd.DataFrame, summary: pd.DataFrame, pop: pd.DataFrame, gdp: pd.DataFrame, horizon_years: int = 6, scenario: str = "Base") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Advanced but deployment-safe growth model.
+
+    Model design:
+    1) Builds macro state features from GDP history and population growth.
+    2) Fits a regularized cross-state ridge model to explain 2021-2024 store CAGR.
+    3) Blends model-implied growth with recent state/store momentum and national mean reversion.
+    4) Projects state and store volumes forward with uncertainty bands.
+    """
+    macro = build_macro_state_features(summary, pop, gdp)
+    work = macro[macro["Store_Count"].fillna(0).gt(0)].copy()
+    work["State_CAGR_21_24_W"] = winsorize_series(work["CAGR_21_24"], 0.05, 0.95)
+    work["State_Growth_24_23_W"] = winsorize_series(work["Growth_24_vs_23"], 0.05, 0.95)
+    work["GDP_CAGR_10Y"] = work.get("GDP_CAGR_10Y", pd.Series(np.nan, index=work.index)).fillna(work.get("GDP_CAGR_All", np.nan))
+    work["GDP_CAGR_10Y"] = winsorize_series(work["GDP_CAGR_10Y"], 0.05, 0.95)
+    work["Population_Growth_23_24"] = winsorize_series(work.get("Population_Growth_23_24", pd.Series(np.nan, index=work.index)), 0.05, 0.95)
+    work["GDP_Volatility_10Y"] = work.get("GDP_Volatility_10Y", pd.Series(np.nan, index=work.index)).fillna(work.get("GDP_Volatility_5Y", np.nan))
+
+    feature_cols = [
+        "GDP_CAGR_10Y", "GDP_CAGR_All", "GDP_Volatility_10Y", "Population_Growth_23_24",
+        "Stores_per_1M_People", "Revenue_per_Capita", "Revenue_per_GDP_Million", "Volume_per_Store",
+        "Revenue_per_SqFt", "Avg_Stability", "Avg_Store_Age", "Store_Count",
+    ]
+    feature_cols = [c for c in feature_cols if c in work.columns]
+    work["Target_CAGR"] = work["State_CAGR_21_24_W"]
+    macro_pred, coef_df = ridge_predict(work, feature_cols, "Target_CAGR", work, alpha=3.0)
+    work["Macro_Model_CAGR"] = winsorize_series(macro_pred, 0.05, 0.95)
+
+    national_cagr = (stores["24 Volume Dollars"].sum() / stores["21 Volume Dollars"].sum()) ** (1/3) - 1 if stores["21 Volume Dollars"].sum() else work["Target_CAGR"].median()
+    national_last = (stores["24 Volume Dollars"].sum() - stores["23 Volume Dollars"].sum()) / stores["23 Volume Dollars"].sum() if stores["23 Volume Dollars"].sum() else national_cagr
+    work["Store_Count_Confidence"] = np.sqrt(work["Store_Count"].clip(lower=1)) / np.sqrt(work["Store_Count"].clip(lower=1).max())
+
+    # Hierarchical blend: recent measured state behavior dominates, macro explains persistence, national trend adds mean reversion.
+    work["Base_Projected_Growth"] = (
+        0.34 * work["State_CAGR_21_24_W"].fillna(national_cagr) +
+        0.18 * work["State_Growth_24_23_W"].fillna(national_last) +
+        0.28 * work["Macro_Model_CAGR"].fillna(national_cagr) +
+        0.12 * work["Macro_Growth_Signal"].fillna(national_cagr) +
+        0.08 * national_cagr
+    )
+    # Low-store states are pulled toward national trend because small sample growth can be noisy.
+    work["Base_Projected_Growth"] = work["Base_Projected_Growth"] * work["Store_Count_Confidence"] + national_cagr * (1 - work["Store_Count_Confidence"])
+    work["Base_Projected_Growth"] = work["Base_Projected_Growth"].clip(lower=-0.12, upper=0.16)
+
+    scenario_adj = {"Conservative": -0.015, "Base": 0.0, "Optimistic": 0.015}.get(scenario, 0.0)
+    work["Projected_Growth_Rate"] = (work["Base_Projected_Growth"] + scenario_adj).clip(lower=-0.15, upper=0.20)
+    work["Macro_Projected_Growth_Rate"] = work["Macro_Growth_Signal"].fillna(work["Projected_Growth_Rate"]).clip(lower=-0.08, upper=0.12)
+    work["Model_Residual"] = work["Target_CAGR"] - work["Macro_Model_CAGR"]
+    residual_sd = work["Model_Residual"].std(skipna=True)
+    residual_sd = residual_sd if pd.notna(residual_sd) and residual_sd > 0 else 0.035
+    work["Uncertainty"] = (
+        residual_sd +
+        work[["Growth_22_vs_21", "Growth_23_vs_22", "Growth_24_vs_23"]].std(axis=1, skipna=True).fillna(0.025) * 0.55 +
+        (1 - work["Store_Count_Confidence"]) * 0.025
+    ).clip(lower=0.02, upper=0.12)
+
+    projection_rows = []
+    years = list(range(2024, 2024 + horizon_years + 1))
+    for _, r in work.iterrows():
+        base_vol = r.get("Volume_2024", np.nan)
+        base_pop = r.get("Population 2024", np.nan)
+        base_gdp = r.get("GDP_2020_Millions", np.nan)
+        # Bring GDP base from 2020 to 2024 with long-run state growth before projecting.
+        gdp_base_2024 = base_gdp * ((1 + (r.get("GDP_CAGR_10Y", np.nan) if pd.notna(r.get("GDP_CAGR_10Y", np.nan)) else 0.025)) ** 4) if pd.notna(base_gdp) else np.nan
+        for y in years:
+            t = y - 2024
+            growth = r["Projected_Growth_Rate"]
+            macro_growth = r["Macro_Projected_Growth_Rate"]
+            unc = r["Uncertainty"] * math.sqrt(max(t, 1))
+            projection_rows.append({
+                "State": r["State"], "State Abbr": r["State Abbr"], "Year": y,
+                "Projected Volume": base_vol * ((1 + growth) ** t) if pd.notna(base_vol) else np.nan,
+                "Low Case Volume": base_vol * ((1 + growth - unc) ** t) if pd.notna(base_vol) else np.nan,
+                "High Case Volume": base_vol * ((1 + growth + unc) ** t) if pd.notna(base_vol) else np.nan,
+                "Projected Population": base_pop * ((1 + r.get("Population_Growth_23_24", 0.0)) ** t) if pd.notna(base_pop) else np.nan,
+                "Projected GDP Millions": gdp_base_2024 * ((1 + macro_growth) ** t) if pd.notna(gdp_base_2024) else np.nan,
+                "Projected Growth Rate": growth,
+                "Macro Growth Signal": macro_growth,
+                "Uncertainty": r["Uncertainty"],
+            })
+    projection = pd.DataFrame(projection_rows)
+
+    store_work = stores.copy()
+    state_growth_map = work.set_index("State Abbr")["Projected_Growth_Rate"].to_dict()
+    state_uncert_map = work.set_index("State Abbr")["Uncertainty"].to_dict()
+    state_macro_map = work.set_index("State Abbr")["Macro_Projected_Growth_Rate"].to_dict()
+    store_work["State Projected Growth"] = store_work["State Abbr"].map(state_growth_map).fillna(national_cagr)
+    store_work["State Macro Signal"] = store_work["State Abbr"].map(state_macro_map).fillna(national_cagr)
+    store_work["Projection Uncertainty"] = store_work["State Abbr"].map(state_uncert_map).fillna(residual_sd)
+    productivity_center = store_work["Productivity Index"].median() if "Productivity Index" in store_work.columns else 50.0
+    productivity_lift = ((store_work.get("Productivity Index", productivity_center) - productivity_center) / 1000).clip(-0.025, 0.025)
+    store_work["Store Momentum CAGR"] = winsorize_series(store_work.get("CAGR 21-24", pd.Series(np.nan, index=store_work.index)), 0.03, 0.97).fillna(store_work["State Projected Growth"])
+    store_work["Last YoY Growth"] = winsorize_series(store_work.get("YoY Growth 24 vs 23", pd.Series(np.nan, index=store_work.index)), 0.03, 0.97).fillna(store_work["Store Momentum CAGR"])
+    store_work["Projected Store Growth"] = (
+        0.40 * store_work["Store Momentum CAGR"] +
+        0.35 * store_work["State Projected Growth"] +
+        0.15 * store_work["Last YoY Growth"] +
+        0.10 * store_work["State Macro Signal"] +
+        productivity_lift
+    ).clip(lower=-0.18, upper=0.22)
+    target_year = 2024 + horizon_years
+    store_work[f"Projected {target_year} Volume"] = store_work["24 Volume Dollars"] * ((1 + store_work["Projected Store Growth"]) ** horizon_years)
+    store_work[f"Projected {target_year} Low"] = store_work["24 Volume Dollars"] * ((1 + store_work["Projected Store Growth"] - store_work["Projection Uncertainty"]) ** horizon_years)
+    store_work[f"Projected {target_year} High"] = store_work["24 Volume Dollars"] * ((1 + store_work["Projected Store Growth"] + store_work["Projection Uncertainty"]) ** horizon_years)
+    store_work["Projected Volume Change"] = store_work[f"Projected {target_year} Volume"] - store_work["24 Volume Dollars"]
+
+    work[f"Projected_{target_year}_Volume"] = work["Volume_2024"] * ((1 + work["Projected_Growth_Rate"]) ** horizon_years)
+    work[f"Projected_{target_year}_Change"] = work[f"Projected_{target_year}_Volume"] - work["Volume_2024"]
+    work["Model_Confidence"] = (100 - work["Uncertainty"] * 450).clip(lower=35, upper=95)
+    return work, projection, store_work, coef_df
+
 def display_df(df: pd.DataFrame, money_cols: List[str] = None, pct_cols: List[str] = None, height: int = 360):
     money_cols = money_cols or []
     pct_cols = pct_cols or []
@@ -555,7 +754,7 @@ def display_df(df: pd.DataFrame, money_cols: List[str] = None, pct_cols: List[st
 # Sidebar and initial data
 # -----------------------------
 st.markdown(f'<div class="big-title">🗺️ {APP_NAME}</div>', unsafe_allow_html=True)
-st.caption("A practical benchmarking dashboard for store efficiency, growth, saturation, opportunity, category flags, volume bands, and maturity. No AI forecast tab is included.")
+st.caption("A practical benchmarking dashboard for store efficiency, growth, saturation, opportunity, category flags, advanced growth modeling, and maturity. The old AI forecasts tab has been removed.")
 
 pop = load_population()
 gdp = load_gdp()
@@ -660,7 +859,7 @@ tabs = st.tabs([
     "6 Stability",
     "7 Flag Performance",
     "8 Market Opportunity",
-    "9 Volume Bands",
+    "9 Growth Projection",
     "10 Store Maturity",
 ])
 
@@ -796,24 +995,142 @@ with tabs[7]:
     opp_cols = ["State", "State Abbr", "Store_Count", "Population 2024", "GDP_2020_Millions", "Stores_per_1M_People", "Volume_per_Store", "CAGR_21_24", "Opportunity_Score", "Market_Status"]
     display_df(opp[opp_cols], money_cols=["Volume_per_Store"], pct_cols=["CAGR_21_24"], height=430)
 
-# 9 Volume Bands
+# 9 Growth Projection
 with tabs[8]:
-    st.markdown("### Volume Band Movement")
-    st.caption("Identifies stores close to moving up into the next revenue band or at risk near the bottom of the current band.")
-    band_scope = scope.copy()
+    st.markdown("### Advanced Growth Projection Model")
+    st.caption("Projects state and store volume using actual store trends, state GDP history, population growth, market saturation, productivity, and uncertainty bands.")
+
+    model_col1, model_col2, model_col3 = st.columns(3)
+    with model_col1:
+        projection_horizon = st.slider("Projection horizon", 2, 8, 6, 1, key="growth_projection_horizon")
+    with model_col2:
+        scenario = st.selectbox("Scenario", ["Conservative", "Base", "Optimistic"], index=1, key="growth_projection_scenario")
+    with model_col3:
+        focus_level = st.selectbox("Projection focus", ["Selected view", "All states", "All stores"], index=0, key="growth_projection_focus")
+
+    target_year = 2024 + projection_horizon
+    growth_states, growth_projection, growth_stores, coef_df = build_growth_projection_model(
+        stores, summary, pop, gdp, horizon_years=projection_horizon, scenario=scenario
+    )
+
+    if selected_state != "ALL" and focus_level == "Selected view":
+        state_model_view = growth_states[growth_states["State Abbr"].eq(selected_state)].copy()
+        state_projection_view = growth_projection[growth_projection["State Abbr"].eq(selected_state)].copy()
+        store_model_view = growth_stores[growth_stores["State Abbr"].eq(selected_state)].copy()
+    else:
+        state_model_view = growth_states.copy()
+        state_projection_view = growth_projection.copy()
+        store_model_view = growth_stores.copy()
+
+    st.markdown("#### How the model works")
+    st.write(
+        "The model is intentionally explainable rather than a black-box forecast. It first calculates each state's actual 2021-2024 store-volume CAGR and latest YoY growth. "
+        "It then builds macro features from the bundled GDP file, including long-run GDP CAGR, 10-year GDP CAGR, GDP volatility, population growth, store density, revenue per capita, revenue per GDP, store productivity, and maturity. "
+        "A regularized ridge model is fit across states to estimate how those macro conditions relate to recent store growth. The final growth rate blends measured store momentum, state momentum, macro-model growth, population/GDP signal, and national mean reversion. "
+        "Small-store-count states are pulled more toward the national trend because a single store can make growth look artificially high or low. Store-level projections then blend each store's own momentum with its state model and productivity index."
+    )
+
+    if not state_model_view.empty:
+        total_2024 = state_model_view["Volume_2024"].sum()
+        total_target = state_model_view[f"Projected_{target_year}_Volume"].sum()
+        target_change = total_target - total_2024
+        blended_growth = (total_target / total_2024) ** (1 / projection_horizon) - 1 if total_2024 else np.nan
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric(f"Projected {target_year} Volume", fmt_money(total_target), delta=fmt_money(target_change))
+        k2.metric("Implied Annual Growth", fmt_pct(blended_growth))
+        k3.metric("Avg Model Confidence", fmt_float(state_model_view["Model_Confidence"].mean(), 1) + "/100")
+        k4.metric("States in Model View", fmt_num(state_model_view["State Abbr"].nunique()))
+
     c1, c2 = st.columns(2)
-    upgrade = band_scope.dropna(subset=["Distance to Next Band"]).sort_values("Distance to Next Band", ascending=True)
-    risk = band_scope.dropna(subset=["Distance Above Lower Band"]).sort_values("Distance Above Lower Band", ascending=True)
     with c1:
-        st.plotly_chart(bar_chart(upgrade.head(top_n), "Distance to Next Band", "Store Number - Name", "Closest to Next Volume Band", "h"), use_container_width=True)
+        if not state_projection_view.empty:
+            if selected_state == "ALL" or focus_level != "Selected view":
+                national_proj = state_projection_view.groupby("Year", as_index=False).agg(
+                    **{"Projected Volume": ("Projected Volume", "sum"), "Low Case Volume": ("Low Case Volume", "sum"), "High Case Volume": ("High Case Volume", "sum")}
+                )
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=national_proj["Year"], y=national_proj["High Case Volume"], mode="lines", name="High Case", line=dict(width=0), showlegend=False))
+                fig.add_trace(go.Scatter(x=national_proj["Year"], y=national_proj["Low Case Volume"], mode="lines", name="Low Case", fill="tonexty", line=dict(width=0), fillcolor="rgba(128,128,128,.22)", showlegend=False))
+                fig.add_trace(go.Scatter(x=national_proj["Year"], y=national_proj["Projected Volume"], mode="lines+markers", name="Base Projection"))
+                fig.update_layout(title=f"Projected Volume Path — {scenario} Scenario", height=430, margin=dict(l=10, r=10, t=50, b=10), yaxis_tickprefix="$")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=state_projection_view["Year"], y=state_projection_view["High Case Volume"], mode="lines", name="High Case", line=dict(width=0), showlegend=False))
+                fig.add_trace(go.Scatter(x=state_projection_view["Year"], y=state_projection_view["Low Case Volume"], mode="lines", name="Low Case", fill="tonexty", line=dict(width=0), fillcolor="rgba(128,128,128,.22)", showlegend=False))
+                fig.add_trace(go.Scatter(x=state_projection_view["Year"], y=state_projection_view["Projected Volume"], mode="lines+markers", name="Base Projection"))
+                fig.update_layout(title=f"Projected Volume Path — {selected_label}", height=430, margin=dict(l=10, r=10, t=50, b=10), yaxis_tickprefix="$")
+                st.plotly_chart(fig, use_container_width=True)
     with c2:
-        st.plotly_chart(bar_chart(risk.head(top_n), "Distance Above Lower Band", "Store Number - Name", "Closest to Lower Band", "h"), use_container_width=True)
-    if "Volume Band" in band_scope.columns:
-        band_counts = band_scope.groupby("Volume Band", dropna=False).agg(Stores=("State", "count"), Volume_2024=("24 Volume Dollars", "sum"), Avg_Rev_per_SqFt=("Revenue per Sq. Ft.", "mean")).reset_index()
-        st.markdown("#### Volume Band Distribution")
-        display_df(band_counts.sort_values("Volume_2024", ascending=False), money_cols=["Volume_2024", "Avg_Rev_per_SqFt"], height=220)
-    band_cols = [c for c in ["Store Number - Name", "City", "State", "Volume Band", "24 Volume Dollars", "Band Lower", "Band Upper", "Band Position", "Distance to Next Band", "Distance Above Lower Band"] if c in band_scope.columns]
-    display_df(band_scope[band_cols].sort_values("Distance to Next Band", ascending=True), money_cols=["24 Volume Dollars", "Band Lower", "Band Upper", "Distance to Next Band", "Distance Above Lower Band"], height=430)
+        rank_states = state_model_view.sort_values(f"Projected_{target_year}_Change", ascending=False)
+        if not rank_states.empty:
+            st.plotly_chart(
+                bar_chart(rank_states.head(top_n), "State", f"Projected_{target_year}_Change", f"Largest Projected Volume Gains by {target_year}"),
+                use_container_width=True,
+            )
+
+    c3, c4 = st.columns(2)
+    with c3:
+        if not state_model_view.empty:
+            fig = px.scatter(
+                state_model_view,
+                x="Population_Growth_23_24",
+                y="Projected_Growth_Rate",
+                size="Store_Count",
+                color="GDP_CAGR_10Y" if "GDP_CAGR_10Y" in state_model_view.columns else None,
+                hover_name="State",
+                title="Population Growth vs Projected Store Growth",
+            )
+            fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10), xaxis_tickformat=".1%", yaxis_tickformat=".1%")
+            st.plotly_chart(fig, use_container_width=True)
+    with c4:
+        if not state_model_view.empty:
+            fig = px.scatter(
+                state_model_view,
+                x="GDP_CAGR_10Y" if "GDP_CAGR_10Y" in state_model_view.columns else "Macro_Growth_Signal",
+                y="Projected_Growth_Rate",
+                size="Volume_2024",
+                color="Model_Confidence",
+                hover_name="State",
+                title="GDP Trend vs Projected Store Growth",
+            )
+            fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10), xaxis_tickformat=".1%", yaxis_tickformat=".1%")
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("#### State Projection Table")
+    state_cols = [
+        "State", "State Abbr", "Store_Count", "Volume_2024", f"Projected_{target_year}_Volume", f"Projected_{target_year}_Change",
+        "Projected_Growth_Rate", "Macro_Growth_Signal", "Population_Growth_23_24", "GDP_CAGR_10Y", "CAGR_21_24", "Growth_24_vs_23",
+        "Stores_per_1M_People", "Revenue_per_Capita", "Model_Confidence", "Uncertainty",
+    ]
+    state_cols = [c for c in state_cols if c in state_model_view.columns]
+    display_df(
+        state_model_view[state_cols].sort_values(f"Projected_{target_year}_Change", ascending=False),
+        money_cols=["Volume_2024", f"Projected_{target_year}_Volume", f"Projected_{target_year}_Change", "Revenue_per_Capita"],
+        pct_cols=["Projected_Growth_Rate", "Macro_Growth_Signal", "Population_Growth_23_24", "GDP_CAGR_10Y", "CAGR_21_24", "Growth_24_vs_23", "Uncertainty"],
+        height=430,
+    )
+
+    st.markdown("#### Store-Level Projection Table")
+    store_cols = [
+        "Store Number - Name", "City", "State", "24 Volume Dollars", f"Projected {target_year} Volume", "Projected Volume Change",
+        "Projected Store Growth", "State Projected Growth", "Store Momentum CAGR", "Last YoY Growth", "Productivity Index", "Revenue per Sq. Ft.", f"Projected {target_year} Low", f"Projected {target_year} High",
+    ]
+    store_cols = [c for c in store_cols if c in store_model_view.columns]
+    display_df(
+        store_model_view[store_cols].sort_values("Projected Volume Change", ascending=False),
+        money_cols=["24 Volume Dollars", f"Projected {target_year} Volume", "Projected Volume Change", "Revenue per Sq. Ft.", f"Projected {target_year} Low", f"Projected {target_year} High"],
+        pct_cols=["Projected Store Growth", "State Projected Growth", "Store Momentum CAGR", "Last YoY Growth"],
+        height=430,
+    )
+
+    with st.expander("Model coefficients and diagnostics"):
+        st.write("Positive coefficients increase the model-implied CAGR; negative coefficients decrease it. Coefficients are standardized because the ridge model standardizes features internally.")
+        if not coef_df.empty:
+            st.dataframe(coef_df.sort_values("Coefficient", ascending=False), use_container_width=True, height=300)
+        diag_cols = [c for c in ["State", "Target_CAGR", "Macro_Model_CAGR", "Model_Residual", "Base_Projected_Growth", "Projected_Growth_Rate", "Uncertainty", "Model_Confidence"] if c in growth_states.columns]
+        if diag_cols:
+            display_df(growth_states[diag_cols].sort_values("Model_Residual", ascending=False), pct_cols=["Target_CAGR", "Macro_Model_CAGR", "Model_Residual", "Base_Projected_Growth", "Projected_Growth_Rate", "Uncertainty"], height=300)
 
 # 10 Store Maturity
 with tabs[9]:

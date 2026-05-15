@@ -32,7 +32,7 @@ Then upload `Store List v1.csv` in the sidebar.
 
 ## Main dashboard features
 
-The previous AI forecast tab has been removed. The dashboard now focuses on explainable business metrics and benchmarking:
+The previous AI forecast tab has been removed. The dashboard now focuses on explainable business metrics, benchmarking, and one advanced but transparent growth projection model:
 
 1. Revenue per square foot
 2. Year-over-year growth
@@ -42,7 +42,7 @@ The previous AI forecast tab has been removed. The dashboard now focuses on expl
 6. Volume stability
 7. Category / market flag performance
 8. Market opportunity score
-9. Volume band movement
+9. Advanced growth projection model
 10. Store age / maturity analysis
 
 ## Notes
@@ -50,3 +50,18 @@ The previous AI forecast tab has been removed. The dashboard now focuses on expl
 - Store volume fields such as `24 Volume` are automatically scaled to dollars when the app detects that they are stored in thousands.
 - If exact latitude/longitude columns are not provided in the store list, store locations are plotted using state centroids plus deterministic jitter so that locations remain visible on the map.
 - The map supports state-level drilldown through the sidebar. Newer Streamlit versions also support point selection on the map markers.
+
+
+## Advanced Growth Projection tab
+
+The Growth Projection tab replaces the old Volume Bands view. It uses an explainable, deployment-safe model rather than a black-box neural forecast.
+
+The model:
+
+1. Calculates actual 2021-2024 store and state volume trends.
+2. Builds state macro features from the bundled GDP and population files.
+3. Uses a NumPy-based ridge regression model to estimate how macro conditions relate to recent store growth.
+4. Blends the macro model with actual state/store momentum and national mean reversion.
+5. Produces state-level and store-level projections with low/base/high uncertainty bands.
+
+This keeps the model useful on GitHub and Streamlit Cloud without requiring TensorFlow, PyTorch, or scikit-learn.
