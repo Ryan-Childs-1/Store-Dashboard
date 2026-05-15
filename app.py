@@ -870,6 +870,173 @@ def display_df(df: pd.DataFrame, money_cols: List[str] = None, pct_cols: List[st
 
 
 # -----------------------------
+# Strategic insight helpers
+# -----------------------------
+IMPORTANT_GDP_SEGMENTS = {
+    "Retail trade": {"weight": 0.30, "role": "Best direct proxy for the size of the state retail economy."},
+    "Accommodation and food services": {"weight": 0.20, "role": "Tourism, travel, camping-trip, and destination-market proxy."},
+    "Arts, entertainment, and recreation": {"weight": 0.15, "role": "Closest GDP category to recreation activity."},
+    "Agriculture, forestry, fishing and hunting": {"weight": 0.15, "role": "Rural, hunting, fishing, forestry, and outdoor-culture proxy."},
+    "Natural resources and mining": {"weight": 0.10, "role": "Rugged/resource-state lifestyle and rural economy proxy."},
+    "All industry total": {"weight": 0.10, "role": "General economic strength control."},
+}
+
+
+def get_gdp_segment_panel(gdp: pd.DataFrame, pop: pd.DataFrame) -> pd.DataFrame:
+    """Return one row per state with selected GDP segments, per-capita values, and segment CAGRs."""
+    if gdp.empty or "Description" not in gdp.columns:
+        return pd.DataFrame()
+    year_cols = sorted([c for c in gdp.columns if re.fullmatch(r"\d{4}", str(c))])
+    if not year_cols:
+        return pd.DataFrame()
+    latest_year = year_cols[-1]
+    base_year = "2010" if "2010" in year_cols else year_cols[0]
+    rows = []
+    for seg in IMPORTANT_GDP_SEGMENTS:
+        seg_df = gdp[gdp["Description"].eq(seg)].copy()
+        if seg_df.empty:
+            continue
+        for _, r in seg_df.iterrows():
+            abbr = r.get("State Abbr")
+            if not isinstance(abbr, str) or not abbr:
+                continue
+            latest = pd.to_numeric(pd.Series([r.get(latest_year)]), errors="coerce").iloc[0]
+            base = pd.to_numeric(pd.Series([r.get(base_year)]), errors="coerce").iloc[0]
+            n = max(int(latest_year) - int(base_year), 1)
+            cagr = (latest / base) ** (1 / n) - 1 if pd.notna(latest) and pd.notna(base) and base > 0 else np.nan
+            rows.append({"State Abbr": abbr, "State": ABBR_STATE.get(abbr, r.get("State")), "Segment": seg, "GDP_Millions": latest, "GDP_CAGR": cagr})
+    long = pd.DataFrame(rows)
+    if long.empty:
+        return pd.DataFrame()
+    panel = long.pivot_table(index=["State Abbr", "State"], columns="Segment", values="GDP_Millions", aggfunc="first").reset_index()
+    cagr_panel = long.pivot_table(index=["State Abbr"], columns="Segment", values="GDP_CAGR", aggfunc="first").reset_index()
+    cagr_panel = cagr_panel.rename(columns={c: f"{c} CAGR" for c in cagr_panel.columns if c != "State Abbr"})
+    panel = panel.merge(cagr_panel, on="State Abbr", how="left")
+    if not pop.empty and "State Abbr" in pop.columns:
+        panel = panel.merge(pop[[c for c in ["State Abbr", "Population 2024", "Population 2023", "Growth Rate"] if c in pop.columns]].drop_duplicates("State Abbr"), on="State Abbr", how="left")
+    for seg in IMPORTANT_GDP_SEGMENTS:
+        if seg in panel.columns:
+            panel[f"{seg} per Capita"] = (panel[seg] * 1_000_000) / panel.get("Population 2024", np.nan).replace(0, np.nan)
+    return panel
+
+
+def add_outdoor_macro_scores(summary: pd.DataFrame, gdp: pd.DataFrame, pop: pd.DataFrame) -> pd.DataFrame:
+    out = summary.copy()
+    panel = get_gdp_segment_panel(gdp, pop)
+    if panel.empty:
+        out["Outdoor_Retail_Macro_Score"] = np.nan
+        out["Retail_GDP_per_Capita"] = np.nan
+        out["Outdoor_Macro_GDP_Millions"] = np.nan
+        return out
+    keep = ["State Abbr"]
+    for seg in IMPORTANT_GDP_SEGMENTS:
+        keep += [c for c in [seg, f"{seg} CAGR", f"{seg} per Capita"] if c in panel.columns]
+    out = out.merge(panel[keep].drop_duplicates("State Abbr"), on="State Abbr", how="left")
+    score = pd.Series(0.0, index=out.index)
+    weight_sum = 0.0
+    macro_total = pd.Series(0.0, index=out.index)
+    for seg, meta in IMPORTANT_GDP_SEGMENTS.items():
+        per_cap = f"{seg} per Capita"
+        if per_cap in out.columns:
+            w = meta["weight"]
+            score += w * rank_pct(out[per_cap], True).fillna(50)
+            weight_sum += w
+        if seg in out.columns and seg != "All industry total":
+            macro_total = macro_total.add(out[seg].fillna(0) * meta["weight"], fill_value=0)
+    out["Outdoor_Retail_Macro_Score"] = score / weight_sum if weight_sum else np.nan
+    out["Retail_GDP_per_Capita"] = out.get("Retail trade per Capita", np.nan)
+    out["Outdoor_Macro_GDP_Millions"] = macro_total.replace(0, np.nan)
+    out["Stores_per_$10B_Retail_GDP"] = out["Store_Count"] / (out.get("Retail trade", np.nan) / 10_000).replace(0, np.nan)
+    out["Retail_GDP_per_Store_Millions"] = out.get("Retail trade", np.nan) / out["Store_Count"].replace(0, np.nan)
+    out["Outdoor_Macro_per_Store_Millions"] = out["Outdoor_Macro_GDP_Millions"] / out["Store_Count"].replace(0, np.nan)
+    out["Market_Penetration_Retail_GDP"] = out["Volume_2024"] / (out.get("Retail trade", np.nan) * 1_000_000).replace(0, np.nan)
+    out["Outdoor_Market_Penetration"] = out["Volume_2024"] / (out["Outdoor_Macro_GDP_Millions"] * 1_000_000).replace(0, np.nan)
+    out["White_Space_Score"] = (
+        0.32 * rank_pct(out.get("Outdoor_Retail_Macro_Score"), True).fillna(50) +
+        0.22 * rank_pct(out.get("Population 2024"), True).fillna(50) +
+        0.18 * rank_pct(out.get("Retail_GDP_per_Store_Millions"), True).fillna(50) +
+        0.18 * rank_pct(out.get("Stores_per_1M_People"), False).fillna(50) +
+        0.10 * rank_pct(out.get("Volume_per_Store"), True).fillna(50)
+    )
+    out["Risk_Score"] = (
+        0.35 * rank_pct(out.get("Growth_24_vs_23"), False).fillna(50) +
+        0.25 * rank_pct(out.get("CAGR_21_24"), False).fillna(50) +
+        0.20 * rank_pct(out.get("Revenue_per_SqFt"), False).fillna(50) +
+        0.20 * rank_pct(out.get("Store_Count"), True).fillna(50)
+    )
+    # Four-quadrant strategic classification.
+    macro_med = out["Outdoor_Retail_Macro_Score"].median(skipna=True)
+    density_med = out["Stores_per_1M_People"].median(skipna=True)
+    def _fit_status(r):
+        strong = r.get("Outdoor_Retail_Macro_Score", np.nan) >= macro_med
+        saturated = r.get("Stores_per_1M_People", np.nan) >= density_med
+        if strong and not saturated:
+            return "Strong Fit / Underpenetrated"
+        if strong and saturated:
+            return "Strong Fit / Saturated"
+        if (not strong) and saturated:
+            return "Weak Fit / Overstored"
+        return "Weak Fit / Low Presence"
+    out["Outdoor_Fit_Status"] = out.apply(_fit_status, axis=1)
+    return out
+
+
+def add_store_diagnostics(stores: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
+    df = stores.copy()
+    state_map = summary.set_index("State Abbr") if "State Abbr" in summary.columns else pd.DataFrame()
+    if not state_map.empty:
+        for c in ["Outdoor_Retail_Macro_Score", "White_Space_Score", "Risk_Score", "Revenue_per_SqFt", "Growth_24_vs_23", "Stores_per_1M_People", "Retail_GDP_per_Store_Millions", "Outdoor_Fit_Status"]:
+            if c in state_map.columns:
+                df[f"State {c}"] = df["State Abbr"].map(state_map[c])
+    # Expected productivity by peer group: state + size band + maturity band blend.
+    df["Peer Expected Rev/SqFt"] = np.nan
+    components = []
+    for col, wt in [("State Abbr", 0.35), ("Size Band", 0.30), ("Maturity Band", 0.20), ("Region", 0.15)]:
+        if col in df.columns and "Revenue per Sq. Ft." in df.columns:
+            m = df.groupby(col, dropna=False)["Revenue per Sq. Ft."].transform("median")
+            components.append((m, wt))
+    if components:
+        num = sum(s.fillna(df["Revenue per Sq. Ft."].median()) * wt for s, wt in components)
+        den = sum(wt for _, wt in components)
+        df["Peer Expected Rev/SqFt"] = num / den
+    if "Revenue per Sq. Ft." in df.columns:
+        df["Rev/SqFt Gap"] = df["Revenue per Sq. Ft."] - df["Peer Expected Rev/SqFt"]
+        df["Rev/SqFt Gap %"] = df["Rev/SqFt Gap"] / df["Peer Expected Rev/SqFt"].replace(0, np.nan)
+    df["Store Diagnostic"] = "Needs deeper review"
+    if "Store Age" in df.columns:
+        df.loc[df["Store Age"].fillna(99).lt(3), "Store Diagnostic"] = "Ramp-up store: compare carefully"
+    if "Rev/SqFt Gap %" in df.columns:
+        df.loc[df["Rev/SqFt Gap %"].lt(-0.25) & df.get("Sq. Footage", pd.Series(0, index=df.index)).gt(df.get("Sq. Footage", pd.Series(0, index=df.index)).median()), "Store Diagnostic"] = "Oversized footprint / low productivity"
+        df.loc[df["Rev/SqFt Gap %"].lt(-0.25) & df.get("State Risk_Score", pd.Series(0, index=df.index)).gt(65), "Store Diagnostic"] = "Statewide weakness + local underperformance"
+        df.loc[df["Rev/SqFt Gap %"].gt(0.25), "Store Diagnostic"] = "Outperformer: study/replicate"
+    # Store archetypes.
+    high_eff = df.get("Revenue per Sq. Ft.", pd.Series(np.nan, index=df.index)) >= df.get("Revenue per Sq. Ft.", pd.Series(np.nan, index=df.index)).quantile(0.70)
+    high_vol = df.get("24 Volume Dollars", pd.Series(np.nan, index=df.index)) >= df.get("24 Volume Dollars", pd.Series(np.nan, index=df.index)).quantile(0.70)
+    large = df.get("Sq. Footage", pd.Series(np.nan, index=df.index)) >= df.get("Sq. Footage", pd.Series(np.nan, index=df.index)).quantile(0.70)
+    low_eff = df.get("Revenue per Sq. Ft.", pd.Series(np.nan, index=df.index)) <= df.get("Revenue per Sq. Ft.", pd.Series(np.nan, index=df.index)).quantile(0.30)
+    df["Store Archetype"] = "Balanced / Core Store"
+    df.loc[high_eff & ~large, "Store Archetype"] = "Compact High-Productivity"
+    df.loc[large & high_vol, "Store Archetype"] = "Large Destination Store"
+    df.loc[large & low_eff, "Store Archetype"] = "Large Underproductive Box"
+    if "Metro Flag" in df.columns:
+        df.loc[df["Metro Flag"].fillna(False), "Store Archetype"] = "Metro Store"
+    for flag, label in [("Ammo Hub Flag", "Ammo Hub Store"), ("Ocean Flag", "Water/Ocean Store"), ("Year Round Kayaks Flag", "Paddlesports Store")]:
+        if flag in df.columns:
+            df.loc[df[flag].fillna(False), "Store Archetype"] = label
+    if "Store Age" in df.columns:
+        df.loc[df["Store Age"].fillna(99).lt(3), "Store Archetype"] = "New / Ramp Store"
+    return df
+
+
+def insight_sentence(label: str, value: str, explanation: str) -> None:
+    st.markdown(f"**{label}:** {value} — {explanation}")
+
+
+def safe_col_list(df: pd.DataFrame, cols: List[str]) -> List[str]:
+    return [c for c in cols if c in df.columns]
+
+
+# -----------------------------
 # Sidebar and initial data
 # -----------------------------
 st.markdown(f'<div class="big-title">🗺️ {APP_NAME}</div>', unsafe_allow_html=True)
@@ -923,6 +1090,9 @@ if stores.empty:
     st.stop()
 
 summary = build_state_summary(stores, pop, gdp)
+summary = add_outdoor_macro_scores(summary, gdp, pop)
+stores = add_store_diagnostics(stores, summary)
+stores_all = add_store_diagnostics(stores_all, summary)
 state_options = ["ALL"] + sorted(stores["State Abbr"].dropna().unique().tolist())
 
 with st.sidebar:
@@ -975,156 +1145,311 @@ st.markdown("---")
 # -----------------------------
 # 10 new analytical tabs
 # -----------------------------
+
 tabs = st.tabs([
-    "1 Revenue / Sq. Ft.",
-    "2 YoY Growth",
-    "3 Store Density",
-    "4 Revenue / Capita",
-    "5 Productivity Index",
-    "6 Stability",
-    "7 Flag Performance",
-    "8 Market Opportunity",
-    "9 Growth Projection",
-    "10 Store Maturity",
+    "1 Major Insights",
+    "2 Revenue / Sq. Ft.",
+    "3 Growth & Risk",
+    "4 Store Format Efficiency",
+    "5 Maturity Cohorts",
+    "6 Saturation & White Space",
+    "7 Outdoor Market Fit / GDP",
+    "8 Market Penetration",
+    "9 Productivity Index",
+    "10 Flag Performance",
+    "11 Store Archetypes",
+    "12 Best Practices",
+    "13 Underperformer Diagnostic",
+    "14 Growth Projection",
+    "15 Stability",
 ])
 
-# 1 Revenue per square foot
+# 1 Major Insights
 with tabs[0]:
+    st.markdown("### Store List v1 — Major Insights")
+    st.caption("These observations are generated from the uploaded Store List v1 file and filtered by the current sidebar settings.")
+    total_24 = scope["24 Volume Dollars"].sum() if "24 Volume Dollars" in scope.columns else np.nan
+    total_23 = scope["23 Volume Dollars"].sum() if "23 Volume Dollars" in scope.columns else np.nan
+    total_21 = scope["21 Volume Dollars"].sum() if "21 Volume Dollars" in scope.columns else np.nan
+    yoy = (total_24 - total_23) / total_23 if pd.notna(total_23) and total_23 else np.nan
+    cagr = (total_24 / total_21) ** (1/3) - 1 if pd.notna(total_21) and total_21 else np.nan
+    weighted_rpsf = total_24 / scope["Sq. Footage"].sum() if "Sq. Footage" in scope.columns and scope["Sq. Footage"].sum() else np.nan
+    insight_cols = st.columns(5)
+    insight_cols[0].metric("2024 Volume", fmt_money(total_24))
+    insight_cols[1].metric("2024 vs 2023", fmt_pct(yoy))
+    insight_cols[2].metric("2021-2024 CAGR", fmt_pct(cagr))
+    insight_cols[3].metric("Weighted Rev/SqFt", fmt_money(weighted_rpsf))
+    insight_cols[4].metric("Stores", fmt_num(len(scope)))
+
+    st.markdown("#### Executive readout")
+    insight_sentence("Network direction", fmt_pct(yoy), "latest-year growth shows whether the current store set is expanding or contracting versus 2023.")
+    insight_sentence("Longer-term trend", fmt_pct(cagr), "the 2021-2024 CAGR helps separate one-year noise from multi-year trend pressure.")
+    insight_sentence("Footprint productivity", fmt_money(weighted_rpsf), "weighted revenue per square foot is a stronger efficiency measure than total revenue alone.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        top_states = summary[summary["Store_Count"].gt(0)].sort_values("Volume_2024", ascending=False)
+        st.plotly_chart(bar_chart(top_states, "State", "Volume_2024", "States by 2024 Volume"), use_container_width=True)
+    with c2:
+        state_eff = summary[summary["Store_Count"].gt(0)].sort_values("Revenue_per_SqFt", ascending=False)
+        st.plotly_chart(bar_chart(state_eff, "State", "Revenue_per_SqFt", "States by Weighted Revenue / Sq. Ft."), use_container_width=True)
+
+    st.markdown("#### Automatically surfaced findings")
+    finding_rows = []
+    if not summary.empty:
+        best_eff = summary[summary["Store_Count"].gt(0)].sort_values("Revenue_per_SqFt", ascending=False).head(1)
+        worst_growth = summary[summary["Store_Count"].gt(0)].sort_values("Growth_24_vs_23", ascending=True).head(1)
+        best_volume = summary[summary["Store_Count"].gt(0)].sort_values("Volume_2024", ascending=False).head(1)
+        if not best_eff.empty:
+            r = best_eff.iloc[0]
+            finding_rows.append({"Insight": "Highest state productivity", "Result": f"{r['State']} at {fmt_money(r['Revenue_per_SqFt'])} per sq. ft.", "Why it matters": "Shows the strongest footprint efficiency."})
+        if not worst_growth.empty:
+            r = worst_growth.iloc[0]
+            finding_rows.append({"Insight": "Largest state decline", "Result": f"{r['State']} at {fmt_pct(r['Growth_24_vs_23'])} YoY", "Why it matters": "Flags a market needing diagnosis."})
+        if not best_volume.empty:
+            r = best_volume.iloc[0]
+            finding_rows.append({"Insight": "Largest revenue state", "Result": f"{r['State']} at {fmt_money(r['Volume_2024'])}", "Why it matters": "Shows where the largest absolute revenue base sits."})
+    if "Size Band" in scope.columns:
+        band = scope.groupby("Size Band", dropna=False).agg(Stores=("State", "count"), Avg_RevSqFt=("Revenue per Sq. Ft.", "mean"), Volume=("24 Volume Dollars", "sum")).reset_index().sort_values("Avg_RevSqFt", ascending=False)
+        if not band.empty:
+            r=band.iloc[0]
+            finding_rows.append({"Insight":"Best size band efficiency", "Result": f"{clean_text(r['Size Band'])}: {fmt_money(r['Avg_RevSqFt'])} avg rev/sq. ft.", "Why it matters":"Tests whether smaller or larger formats are more efficient."})
+    if finding_rows:
+        display_df(pd.DataFrame(finding_rows), height=220)
+
+    st.markdown("#### Store-level highlights")
+    h1, h2 = st.columns(2)
+    with h1:
+        st.markdown("**Best practice candidates**")
+        cols = safe_col_list(scope, ["Store Number - Name", "City", "State", "24 Volume Dollars", "Revenue per Sq. Ft.", "CAGR 21-24", "Productivity Index", "Store Archetype"])
+        display_df(scope.sort_values("Productivity Index", ascending=False)[cols], money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], pct_cols=["CAGR 21-24"], height=320)
+    with h2:
+        st.markdown("**Risk candidates**")
+        risk_cols = safe_col_list(scope, ["Store Number - Name", "City", "State", "24 Volume Dollars", "Revenue per Sq. Ft.", "YoY Growth 24 vs 23", "CAGR 21-24", "Store Diagnostic"])
+        risk_sort = "YoY Growth 24 vs 23" if "YoY Growth 24 vs 23" in scope.columns else "Revenue per Sq. Ft."
+        display_df(scope.sort_values(risk_sort, ascending=True)[risk_cols], money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], pct_cols=["YoY Growth 24 vs 23", "CAGR 21-24"], height=320)
+
+# 2 Revenue per square foot
+with tabs[1]:
     st.markdown("### Revenue per Square Foot")
-    st.caption("This separates big-volume stores from truly efficient stores by comparing 2024 volume against physical footprint.")
+    st.info("This is the core store-efficiency metric: it separates stores that are simply large from stores that are truly productive.")
     c1, c2 = st.columns(2)
     state_eff = summary[summary["Store_Count"].gt(0)].sort_values("Revenue_per_SqFt", ascending=False)
     with c1:
-        st.plotly_chart(bar_chart(state_eff, "State", "Revenue_per_SqFt", "Top States by Revenue / Sq. Ft."), use_container_width=True)
+        st.plotly_chart(bar_chart(state_eff, "State", "Revenue_per_SqFt", "States by Weighted Revenue / Sq. Ft."), use_container_width=True)
     with c2:
         if "Revenue per Sq. Ft." in scope.columns:
-            store_eff = scope.sort_values("Revenue per Sq. Ft.", ascending=False)
-            st.plotly_chart(bar_chart(store_eff, "Revenue per Sq. Ft.", "Store Number - Name", "Top Stores by Revenue / Sq. Ft.", "h"), use_container_width=True)
-    cols = [c for c in ["Store Number - Name", "City", "State", "24 Volume Dollars", "Sq. Footage", "Revenue per Sq. Ft.", "Volume Band"] if c in scope.columns]
-    display_df(scope[cols].sort_values("Revenue per Sq. Ft.", ascending=False), money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], height=390)
+            fig = px.scatter(scope, x="Sq. Footage", y="Revenue per Sq. Ft.", size="24 Volume Dollars", color="State Abbr", hover_name="Store Number - Name", title="Footprint vs Productivity")
+            fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10), yaxis_tickprefix="$")
+            st.plotly_chart(fig, use_container_width=True)
+    cols = safe_col_list(scope, ["Store Number - Name", "City", "State", "Size Band", "24 Volume Dollars", "Sq. Footage", "Revenue per Sq. Ft.", "Store Diagnostic"])
+    display_df(scope[cols].sort_values("Revenue per Sq. Ft.", ascending=False), money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], height=430)
 
-# 2 YoY Growth
-with tabs[1]:
-    st.markdown("### Year-over-Year Growth")
-    st.caption("Growth metrics are based on actual 2021-2024 store volume history, not forecasts.")
+# 3 Growth & Risk
+with tabs[2]:
+    st.markdown("### Growth & Risk Monitor")
+    st.info("This view focuses on actual measured growth/decline. New stores with missing older history should be interpreted separately from mature stores.")
     c1, c2 = st.columns(2)
     with c1:
         st.plotly_chart(trend_chart(scope, f"Volume Trend — {selected_label}"), use_container_width=True)
     with c2:
-        growth_state = summary[summary["Store_Count"].gt(0)].sort_values("Growth_24_vs_23", ascending=False)
-        st.plotly_chart(bar_chart(growth_state, "State", "Growth_24_vs_23", "Best 24 vs 23 Growth by State"), use_container_width=True)
-    growth_cols = [c for c in ["Store Number - Name", "City", "State", "21 Volume Dollars", "22 Volume Dollars", "23 Volume Dollars", "24 Volume Dollars", "YoY Growth 22 vs 21", "YoY Growth 23 vs 22", "YoY Growth 24 vs 23", "CAGR 21-24"] if c in scope.columns]
-    display_df(scope[growth_cols].sort_values("YoY Growth 24 vs 23", ascending=False), money_cols=["21 Volume Dollars", "22 Volume Dollars", "23 Volume Dollars", "24 Volume Dollars"], pct_cols=["YoY Growth 22 vs 21", "YoY Growth 23 vs 22", "YoY Growth 24 vs 23", "CAGR 21-24"], height=410)
+        state_risk = summary[summary["Store_Count"].gt(0)].sort_values("Risk_Score", ascending=False)
+        st.plotly_chart(bar_chart(state_risk, "State", "Risk_Score", "Highest State Risk Scores"), use_container_width=True)
+    risk_cols = safe_col_list(summary, ["State", "Store_Count", "Volume_2024", "Growth_24_vs_23", "CAGR_21_24", "Revenue_per_SqFt", "Risk_Score"])
+    display_df(summary[summary["Store_Count"].gt(0)].sort_values("Risk_Score", ascending=False)[risk_cols], money_cols=["Volume_2024", "Revenue_per_SqFt"], pct_cols=["Growth_24_vs_23", "CAGR_21_24"], height=320)
+    st.markdown("#### Store decline table")
+    cols = safe_col_list(scope, ["Store Number - Name", "City", "State", "24 Volume Dollars", "YoY Growth 24 vs 23", "CAGR 21-24", "Stability Score", "Store Diagnostic"])
+    display_df(scope.sort_values("YoY Growth 24 vs 23", ascending=True)[cols], money_cols=["24 Volume Dollars"], pct_cols=["YoY Growth 24 vs 23", "CAGR 21-24"], height=380)
 
-# 3 Store Density
-with tabs[2]:
-    st.markdown("### Store Density by Population")
-    st.caption("Useful for identifying underpenetrated or oversaturated states relative to population.")
-    c1, c2 = st.columns(2)
-    density_df = summary[summary["Store_Count"].gt(0)].copy()
-    with c1:
-        st.plotly_chart(bar_chart(density_df.sort_values("Stores_per_1M_People", ascending=False), "State", "Stores_per_1M_People", "Highest Stores per 1M People"), use_container_width=True)
-    with c2:
-        st.plotly_chart(bar_chart(density_df.sort_values("Population_per_Store", ascending=False), "State", "Population_per_Store", "Highest Population per Store"), use_container_width=True)
-    density_cols = ["State", "State Abbr", "Store_Count", "Population 2024", "Stores_per_1M_People", "Population_per_Store", "Density (/mile2)"]
-    display_df(density_df[density_cols].sort_values("Stores_per_1M_People", ascending=False), height=410)
-
-# 4 Revenue per Capita
+# 4 Store Format Efficiency
 with tabs[3]:
-    st.markdown("### Revenue per Capita")
-    st.caption("A state-level demand intensity metric: 2024 store volume divided by state population.")
+    st.markdown("### Store Format Efficiency")
+    st.info("This tab tests whether larger stores are earning enough incremental sales to justify their additional footprint.")
+    if "Size Band" in scope.columns:
+        band = scope.groupby("Size Band", dropna=False).agg(
+            Stores=("State", "count"), Volume_2024=("24 Volume Dollars", "sum"), Avg_RevSqFt=("Revenue per Sq. Ft.", "mean"),
+            Weighted_RevSqFt=("24 Volume Dollars", "sum"), SqFt=("Sq. Footage", "sum"), Avg_Growth=("YoY Growth 24 vs 23", "mean")
+        ).reset_index()
+        band["Weighted_RevSqFt"] = band["Volume_2024"] / band["SqFt"].replace(0, np.nan)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(bar_chart(band.sort_values("Weighted_RevSqFt", ascending=False), "Size Band", "Weighted_RevSqFt", "Weighted Revenue / Sq. Ft. by Size Band"), use_container_width=True)
+        with c2:
+            fig = px.box(scope, x="Size Band", y="Revenue per Sq. Ft.", points="all", title="Store Productivity Distribution by Size Band")
+            fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10), yaxis_tickprefix="$")
+            st.plotly_chart(fig, use_container_width=True)
+        display_df(band.sort_values("Weighted_RevSqFt", ascending=False), money_cols=["Volume_2024", "Avg_RevSqFt", "Weighted_RevSqFt"], pct_cols=["Avg_Growth"], height=300)
+    st.markdown("#### Large footprint risk and compact outperformers")
+    c3, c4 = st.columns(2)
+    with c3:
+        st.markdown("**Large underproductive stores**")
+        cols = safe_col_list(scope, ["Store Number - Name", "State", "Size Band", "Sq. Footage", "24 Volume Dollars", "Revenue per Sq. Ft.", "Store Diagnostic"])
+        display_df(scope.sort_values(["Sq. Footage", "Revenue per Sq. Ft."], ascending=[False, True])[cols], money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], height=330)
+    with c4:
+        st.markdown("**Compact high-productivity stores**")
+        cols = safe_col_list(scope, ["Store Number - Name", "State", "Size Band", "Sq. Footage", "24 Volume Dollars", "Revenue per Sq. Ft.", "Productivity Index"])
+        compact = scope.sort_values(["Revenue per Sq. Ft.", "Sq. Footage"], ascending=[False, True])
+        display_df(compact[cols], money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], height=330)
+
+# 5 Maturity Cohorts
+with tabs[4]:
+    st.markdown("### Mature vs New Store Performance")
+    st.info("Growth should be interpreted by store age. New stores often have missing early-year volume, while mature stores give a cleaner read on organic performance.")
+    if "Maturity Band" in scope.columns:
+        cohort = scope.groupby("Maturity Band", dropna=False).agg(
+            Stores=("State", "count"), Volume_2024=("24 Volume Dollars", "sum"), Avg_RevSqFt=("Revenue per Sq. Ft.", "mean"),
+            Avg_YoY=("YoY Growth 24 vs 23", "mean"), Avg_CAGR=("CAGR 21-24", "mean"), Avg_Age=("Store Age", "mean")
+        ).reset_index()
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(bar_chart(cohort, "Maturity Band", "Avg_RevSqFt", "Revenue / Sq. Ft. by Maturity Cohort"), use_container_width=True)
+        with c2:
+            st.plotly_chart(bar_chart(cohort, "Maturity Band", "Avg_YoY", "Latest YoY Growth by Maturity Cohort"), use_container_width=True)
+        display_df(cohort, money_cols=["Volume_2024", "Avg_RevSqFt"], pct_cols=["Avg_YoY", "Avg_CAGR"], height=300)
+    cols = safe_col_list(scope, ["Store Number - Name", "State", "Grand Opening Year", "Store Age", "Maturity Band", "24 Volume Dollars", "Revenue per Sq. Ft.", "YoY Growth 24 vs 23", "CAGR 21-24"])
+    display_df(scope.sort_values("Store Age", ascending=True)[cols], money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], pct_cols=["YoY Growth 24 vs 23", "CAGR 21-24"], height=380)
+
+# 6 Saturation & White Space
+with tabs[5]:
+    st.markdown("### State Saturation & White Space")
+    st.info("This turns store density into an expansion-oriented view: population, retail GDP, outdoor macro score, current store count, and revenue productivity are considered together.")
+    ws = summary[summary["Store_Count"].gt(0)].sort_values("White_Space_Score", ascending=False)
     c1, c2 = st.columns(2)
-    rpc = summary[summary["Store_Count"].gt(0)].sort_values("Revenue_per_Capita", ascending=False)
     with c1:
-        st.plotly_chart(bar_chart(rpc, "State", "Revenue_per_Capita", "Revenue per Capita by State"), use_container_width=True)
+        st.plotly_chart(bar_chart(ws, "State", "White_Space_Score", "White Space Score"), use_container_width=True)
     with c2:
-        fig = px.scatter(rpc, x="Population 2024", y="Revenue_per_Capita", size="Store_Count", hover_name="State", title="Population vs Revenue per Capita")
+        fig = px.scatter(ws, x="Stores_per_1M_People", y="Retail_GDP_per_Store_Millions", size="Population 2024", color="White_Space_Score", hover_name="State", title="Store Density vs Retail GDP per Store")
         fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(fig, use_container_width=True)
-    display_df(rpc[["State", "State Abbr", "Store_Count", "Volume_2024", "Population 2024", "Revenue_per_Capita", "Volume_per_Store"]], money_cols=["Volume_2024", "Revenue_per_Capita", "Volume_per_Store"], height=410)
+    cols = safe_col_list(ws, ["State", "Store_Count", "Population 2024", "Stores_per_1M_People", "Retail_GDP_per_Store_Millions", "Outdoor_Macro_per_Store_Millions", "Revenue_per_Capita", "White_Space_Score", "Outdoor_Fit_Status"])
+    display_df(ws[cols], money_cols=["Revenue_per_Capita"], height=430)
 
-# 5 Productivity Index
-with tabs[4]:
-    st.markdown("### Store Productivity Index")
-    st.caption("Composite score: 40% revenue/sq.ft., 25% 2024 volume, 20% 2021-2024 CAGR, 15% stability.")
-    c1, c2 = st.columns(2)
-    prod = scope.sort_values("Productivity Index", ascending=False)
-    with c1:
-        st.plotly_chart(bar_chart(prod, "Productivity Index", "Store Number - Name", "Top Productivity Stores", "h"), use_container_width=True)
-    with c2:
-        band_counts = prod["Productivity Band"].value_counts(dropna=False).reset_index()
-        band_counts.columns = ["Productivity Band", "Stores"]
-        fig = px.pie(band_counts, names="Productivity Band", values="Stores", title="Productivity Band Mix")
-        fig.update_layout(height=420)
-        st.plotly_chart(fig, use_container_width=True)
-    prod_cols = [c for c in ["Store Number - Name", "City", "State", "24 Volume Dollars", "Revenue per Sq. Ft.", "CAGR 21-24", "Stability Score", "Productivity Index", "Productivity Band"] if c in prod.columns]
-    display_df(prod[prod_cols], money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], pct_cols=["CAGR 21-24"], height=410)
-
-# 6 Stability
-with tabs[5]:
-    st.markdown("### Volume Stability")
-    st.caption("Stability uses the coefficient of variation across 2021-2024 annual volume. Higher scores are steadier.")
-    c1, c2 = st.columns(2)
-    stable = scope.sort_values("Stability Score", ascending=False)
-    volatile = scope.sort_values("Volume CV", ascending=False)
-    with c1:
-        st.plotly_chart(bar_chart(stable, "Stability Score", "Store Number - Name", "Most Stable Stores", "h"), use_container_width=True)
-    with c2:
-        st.plotly_chart(bar_chart(volatile, "Volume CV", "Store Number - Name", "Most Volatile Stores", "h"), use_container_width=True)
-    stab_cols = [c for c in ["Store Number - Name", "City", "State", "Volume Avg 2021-2024", "Volume Std 2021-2024", "Volume CV", "Stability Score", "24 Volume Dollars"] if c in scope.columns]
-    display_df(scope[stab_cols].sort_values("Stability Score", ascending=False), money_cols=["Volume Avg 2021-2024", "Volume Std 2021-2024", "24 Volume Dollars"], height=410)
-
-# 7 Flag Performance
+# 7 Outdoor Market Fit / GDP
 with tabs[6]:
-    st.markdown("### Category / Market Flag Performance")
-    st.caption("Compares stores with each operational or market flag against stores without the flag.")
-    rows = []
+    st.markdown("### Outdoor Market Fit / GDP Segment Analysis")
+    st.info("For a hunting, camping, outdoor, and firearms retailer, total GDP is too broad. The app prioritizes retail trade, tourism-adjacent GDP, recreation GDP, agriculture/forestry/fishing/hunting, natural resources, and total GDP as a control.")
+    gdp_panel = get_gdp_segment_panel(gdp, pop)
+    gdp_docs = pd.DataFrame([{"GDP Segment": k, "Weight": v["weight"], "Why selected": v["role"]} for k, v in IMPORTANT_GDP_SEGMENTS.items()])
+    display_df(gdp_docs, pct_cols=["Weight"], height=230)
+    fit = summary[summary["Store_Count"].gt(0)].sort_values("Outdoor_Retail_Macro_Score", ascending=False)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.plotly_chart(bar_chart(fit, "State", "Outdoor_Retail_Macro_Score", "Outdoor Retail Macro Score"), use_container_width=True)
+    with c2:
+        fig = px.scatter(fit, x="Outdoor_Retail_Macro_Score", y="Revenue_per_Capita", size="Store_Count", color="Outdoor_Fit_Status", hover_name="State", title="Macro Fit vs Current Revenue / Capita")
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10), yaxis_tickprefix="$")
+        st.plotly_chart(fig, use_container_width=True)
+    cols = safe_col_list(fit, ["State", "Store_Count", "Outdoor_Retail_Macro_Score", "Outdoor_Fit_Status", "Retail_GDP_per_Capita", "Retail trade", "Accommodation and food services", "Arts, entertainment, and recreation", "Agriculture, forestry, fishing and hunting", "Natural resources and mining"])
+    display_df(fit[cols], money_cols=["Retail_GDP_per_Capita"], height=430)
+
+# 8 Market Penetration
+with tabs[7]:
+    st.markdown("### Market Penetration")
+    st.info("Revenue per capita is useful, but penetration against relevant retail/outdoor GDP is a more strategic measure of whether a state is over- or under-performing its economic base.")
+    pen = summary[summary["Store_Count"].gt(0)].copy()
+    c1, c2 = st.columns(2)
+    with c1:
+        st.plotly_chart(bar_chart(pen.sort_values("Market_Penetration_Retail_GDP", ascending=False), "State", "Market_Penetration_Retail_GDP", "Store Revenue / Retail GDP"), use_container_width=True)
+    with c2:
+        st.plotly_chart(bar_chart(pen.sort_values("Outdoor_Market_Penetration", ascending=False), "State", "Outdoor_Market_Penetration", "Store Revenue / Outdoor Macro GDP"), use_container_width=True)
+    cols = safe_col_list(pen, ["State", "Store_Count", "Volume_2024", "Revenue_per_Capita", "Market_Penetration_Retail_GDP", "Outdoor_Market_Penetration", "Retail_GDP_per_Store_Millions", "Outdoor_Macro_per_Store_Millions"])
+    display_df(pen.sort_values("Market_Penetration_Retail_GDP", ascending=False)[cols], money_cols=["Volume_2024", "Revenue_per_Capita"], pct_cols=["Market_Penetration_Retail_GDP", "Outdoor_Market_Penetration"], height=430)
+
+# 9 Productivity Index
+with tabs[8]:
+    st.markdown("### Productivity Index")
+    st.info("The default index blends revenue per square foot, 2024 volume, measured growth, and stability. It is designed to find productive stores, not just large ones.")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.plotly_chart(bar_chart(scope.sort_values("Productivity Index", ascending=False), "Productivity Index", "Store Number - Name", "Store Productivity Leaders", "h"), use_container_width=True)
+    with c2:
+        if "Productivity Band" in scope.columns:
+            band = scope.groupby("Productivity Band", dropna=False).agg(Stores=("State", "count"), Volume_2024=("24 Volume Dollars", "sum"), Avg_RevSqFt=("Revenue per Sq. Ft.", "mean")).reset_index()
+            st.plotly_chart(bar_chart(band, "Productivity Band", "Stores", "Stores by Productivity Band"), use_container_width=True)
+    cols = safe_col_list(scope, ["Store Number - Name", "City", "State", "24 Volume Dollars", "Revenue per Sq. Ft.", "CAGR 21-24", "Stability Score", "Productivity Index", "Productivity Band", "Store Archetype"])
+    display_df(scope.sort_values("Productivity Index", ascending=False)[cols], money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], pct_cols=["CAGR 21-24"], height=430)
+
+# 10 Flag Performance
+with tabs[9]:
+    st.markdown("### Flag Performance & Merchandising Impact")
+    st.info("This tab compares stores with each operational/market flag against stores without it. Treat small-sample flags carefully.")
+    rows=[]
     base_rev = scope["24 Volume Dollars"].mean() if "24 Volume Dollars" in scope.columns else np.nan
     base_eff = scope["Revenue per Sq. Ft."].mean() if "Revenue per Sq. Ft." in scope.columns else np.nan
     for f in FLAG_COLUMNS:
-        fc = f + " Flag"
-        if fc in scope.columns:
-            yes_df = scope[scope[fc]]
-            no_df = scope[~scope[fc]]
-            rows.append({
-                "Flag": f,
-                "Flagged Stores": len(yes_df),
-                "Share of Stores": len(yes_df) / len(scope) if len(scope) else np.nan,
-                "Avg Volume Flagged": yes_df["24 Volume Dollars"].mean() if not yes_df.empty else np.nan,
-                "Avg Volume Non-Flagged": no_df["24 Volume Dollars"].mean() if not no_df.empty else np.nan,
-                "Volume Lift vs All": yes_df["24 Volume Dollars"].mean() / base_rev - 1 if not yes_df.empty and base_rev else np.nan,
-                "Avg Rev/SqFt Flagged": yes_df["Revenue per Sq. Ft."].mean() if not yes_df.empty and "Revenue per Sq. Ft." in yes_df.columns else np.nan,
-                "Rev/SqFt Lift vs All": yes_df["Revenue per Sq. Ft."].mean() / base_eff - 1 if not yes_df.empty and base_eff else np.nan,
-                "Avg Growth Flagged": yes_df["YoY Growth 24 vs 23"].mean() if not yes_df.empty and "YoY Growth 24 vs 23" in yes_df.columns else np.nan,
-            })
-    flag_df = pd.DataFrame(rows).sort_values("Flagged Stores", ascending=False)
-    c1, c2 = st.columns(2)
-    with c1:
-        st.plotly_chart(bar_chart(flag_df, "Flag", "Flagged Stores", "Flag Store Counts"), use_container_width=True)
-    with c2:
-        st.plotly_chart(bar_chart(flag_df.sort_values("Volume Lift vs All", ascending=False), "Flag", "Volume Lift vs All", "Average Volume Lift vs All Stores"), use_container_width=True)
-    display_df(flag_df, money_cols=["Avg Volume Flagged", "Avg Volume Non-Flagged", "Avg Rev/SqFt Flagged"], pct_cols=["Share of Stores", "Volume Lift vs All", "Rev/SqFt Lift vs All", "Avg Growth Flagged"], height=430)
+        col=f+" Flag"
+        if col in scope.columns:
+            yes=scope[scope[col].fillna(False)]
+            no=scope[~scope[col].fillna(False)]
+            if len(yes)>0:
+                rows.append({"Flag":f,"Flagged Stores":len(yes),"Share of Stores":len(yes)/len(scope),"Avg Volume Flagged":yes["24 Volume Dollars"].mean(),"Avg Volume Non-Flagged":no["24 Volume Dollars"].mean() if len(no) else np.nan,"Volume Lift vs All":yes["24 Volume Dollars"].mean()/base_rev-1 if base_rev else np.nan,"Avg Rev/SqFt Flagged":yes["Revenue per Sq. Ft."].mean(),"Rev/SqFt Lift vs All":yes["Revenue per Sq. Ft."].mean()/base_eff-1 if base_eff else np.nan,"Avg Growth Flagged":yes.get("YoY Growth 24 vs 23", pd.Series(dtype=float)).mean()})
+    flag_df=pd.DataFrame(rows).sort_values("Flagged Stores", ascending=False) if rows else pd.DataFrame()
+    if not flag_df.empty:
+        c1,c2=st.columns(2)
+        with c1:
+            st.plotly_chart(bar_chart(flag_df, "Flag", "Flagged Stores", "Flag Store Counts"), use_container_width=True)
+        with c2:
+            st.plotly_chart(bar_chart(flag_df.sort_values("Rev/SqFt Lift vs All", ascending=False), "Flag", "Rev/SqFt Lift vs All", "Revenue / SqFt Lift vs All Stores"), use_container_width=True)
+        display_df(flag_df, money_cols=["Avg Volume Flagged","Avg Volume Non-Flagged","Avg Rev/SqFt Flagged"], pct_cols=["Share of Stores","Volume Lift vs All","Rev/SqFt Lift vs All","Avg Growth Flagged"], height=430)
 
-# 8 Market Opportunity
-with tabs[7]:
-    st.markdown("### Market Opportunity Score")
-    st.caption("Scores states using population, GDP, low store density, existing revenue per store, and growth. Higher is more attractive for expansion review.")
-    opp = summary[summary["State Abbr"].notna()].copy().sort_values("Opportunity_Score", ascending=False)
-    c1, c2 = st.columns(2)
+# 11 Store Archetypes
+with tabs[10]:
+    st.markdown("### Store Archetype Clustering")
+    st.info("Stores should be compared against similar stores. This tab classifies stores by format, productivity, market flags, and maturity.")
+    if "Store Archetype" in scope.columns:
+        arch = scope.groupby("Store Archetype", dropna=False).agg(Stores=("State", "count"), Volume_2024=("24 Volume Dollars", "sum"), Avg_RevSqFt=("Revenue per Sq. Ft.", "mean"), Avg_Growth=("YoY Growth 24 vs 23", "mean"), Avg_Productivity=("Productivity Index", "mean")).reset_index().sort_values("Avg_Productivity", ascending=False)
+        c1,c2=st.columns(2)
+        with c1:
+            st.plotly_chart(bar_chart(arch, "Store Archetype", "Avg_Productivity", "Average Productivity by Archetype"), use_container_width=True)
+        with c2:
+            st.plotly_chart(bar_chart(arch, "Store Archetype", "Avg_RevSqFt", "Revenue / Sq. Ft. by Archetype"), use_container_width=True)
+        display_df(arch, money_cols=["Volume_2024","Avg_RevSqFt"], pct_cols=["Avg_Growth"], height=300)
+    cols=safe_col_list(scope,["Store Number - Name","State","Size Band","Maturity Band","Store Archetype","24 Volume Dollars","Revenue per Sq. Ft.","Productivity Index","Store Diagnostic"])
+    display_df(scope.sort_values("Store Archetype")[cols], money_cols=["24 Volume Dollars","Revenue per Sq. Ft."], height=380)
+
+# 12 Best Practices
+with tabs[11]:
+    st.markdown("### Best Practices / Clone These Stores")
+    st.info("These are stores worth studying before new openings, remodels, or category changes because they combine volume, efficiency, stability, and market fit.")
+    clone = scope.copy()
+    clone["Clone Score"] = (
+        0.35*rank_pct(clone.get("Revenue per Sq. Ft."), True).fillna(50)+
+        0.20*rank_pct(clone.get("24 Volume Dollars"), True).fillna(50)+
+        0.15*rank_pct(clone.get("Stability Score"), True).fillna(50)+
+        0.15*rank_pct(clone.get("Productivity Index"), True).fillna(50)+
+        0.15*rank_pct(clone.get("State Outdoor_Retail_Macro_Score"), True).fillna(50)
+    )
+    c1,c2=st.columns(2)
     with c1:
-        st.plotly_chart(bar_chart(opp, "State", "Opportunity_Score", "Highest Opportunity States"), use_container_width=True)
+        st.plotly_chart(bar_chart(clone.sort_values("Clone Score", ascending=False), "Clone Score", "Store Number - Name", "Clone Score Leaders", "h"), use_container_width=True)
     with c2:
-        fig = px.scatter(opp, x="Stores_per_1M_People", y="Volume_per_Store", size="Population 2024", color="Opportunity_Score", hover_name="State", title="Store Density vs Revenue per Store")
-        fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
+        fig=px.scatter(clone, x="Revenue per Sq. Ft.", y="YoY Growth 24 vs 23", size="24 Volume Dollars", color="Store Archetype", hover_name="Store Number - Name", title="Efficiency + Momentum Best-Practice Map")
+        fig.update_layout(height=420, margin=dict(l=10,r=10,t=50,b=10), xaxis_tickprefix="$", yaxis_tickformat=".1%")
         st.plotly_chart(fig, use_container_width=True)
-    opp_cols = ["State", "State Abbr", "Store_Count", "Population 2024", "GDP_2020_Millions", "Stores_per_1M_People", "Volume_per_Store", "CAGR_21_24", "Opportunity_Score", "Market_Status"]
-    display_df(opp[opp_cols], money_cols=["Volume_per_Store"], pct_cols=["CAGR_21_24"], height=430)
+    cols=safe_col_list(clone,["Store Number - Name","City","State","Store Archetype","24 Volume Dollars","Revenue per Sq. Ft.","YoY Growth 24 vs 23","Stability Score","Productivity Index","Clone Score"])
+    display_df(clone.sort_values("Clone Score", ascending=False)[cols], money_cols=["24 Volume Dollars","Revenue per Sq. Ft."], pct_cols=["YoY Growth 24 vs 23"], height=430)
 
-# 9 Growth Projection
-with tabs[8]:
-    st.markdown("### Advanced Growth Projection Model")
-    st.caption("Projects state and store volume using actual store trends, state GDP history, population growth, market saturation, productivity, and uncertainty bands.")
+# 13 Underperformer Diagnostic
+with tabs[12]:
+    st.markdown("### Underperformer Diagnostic")
+    st.info("This tab compares each store against expected productivity from its state, size band, maturity cohort, and region. It avoids labeling every low-volume store as bad without context.")
+    diag = scope.copy()
+    diag["Diagnostic Severity"] = rank_pct(-diag.get("Rev/SqFt Gap %", pd.Series(np.nan, index=diag.index)), True).fillna(50)
+    c1,c2=st.columns(2)
+    with c1:
+        st.plotly_chart(bar_chart(diag.sort_values("Diagnostic Severity", ascending=False), "Diagnostic Severity", "Store Number - Name", "Largest Underperformance Gaps", "h"), use_container_width=True)
+    with c2:
+        fig=px.scatter(diag, x="Peer Expected Rev/SqFt", y="Revenue per Sq. Ft.", color="Store Diagnostic", size="24 Volume Dollars", hover_name="Store Number - Name", title="Actual vs Peer-Expected Revenue / Sq. Ft.")
+        fig.add_trace(go.Scatter(x=[diag["Peer Expected Rev/SqFt"].min(), diag["Peer Expected Rev/SqFt"].max()], y=[diag["Peer Expected Rev/SqFt"].min(), diag["Peer Expected Rev/SqFt"].max()], mode="lines", name="Expected line"))
+        fig.update_layout(height=420, margin=dict(l=10,r=10,t=50,b=10), xaxis_tickprefix="$", yaxis_tickprefix="$")
+        st.plotly_chart(fig, use_container_width=True)
+    cols=safe_col_list(diag,["Store Number - Name","State","Size Band","Maturity Band","24 Volume Dollars","Revenue per Sq. Ft.","Peer Expected Rev/SqFt","Rev/SqFt Gap %","Store Diagnostic","State Risk_Score"])
+    display_df(diag.sort_values("Diagnostic Severity", ascending=False)[cols], money_cols=["24 Volume Dollars","Revenue per Sq. Ft.","Peer Expected Rev/SqFt"], pct_cols=["Rev/SqFt Gap %"], height=430)
 
+# 14 Growth Projection
+with tabs[13]:
+    st.markdown("### Macro-Adjusted Growth Projection")
+    st.info("This model is explainable: it blends measured store momentum, state momentum, GDP segment signals, population growth, saturation, maturity, and uncertainty bands. It is not a black-box forecast.")
     model_col1, model_col2, model_col3 = st.columns(3)
     with model_col1:
         projection_horizon = st.slider("Projection horizon", 2, 8, 6, 1, key="growth_projection_horizon")
@@ -1132,160 +1457,58 @@ with tabs[8]:
         scenario = st.selectbox("Scenario", ["Conservative", "Base", "Optimistic"], index=1, key="growth_projection_scenario")
     with model_col3:
         focus_level = st.selectbox("Projection focus", ["Selected view", "All states", "All stores"], index=0, key="growth_projection_focus")
-
     target_year = 2024 + projection_horizon
-    growth_states, growth_projection, growth_stores, coef_df = build_growth_projection_model(
-        stores, summary, pop, gdp, horizon_years=projection_horizon, scenario=scenario
-    )
-
+    growth_states, growth_projection, growth_stores, coef_df = build_growth_projection_model(stores, summary, pop, gdp, horizon_years=projection_horizon, scenario=scenario)
     if selected_state != "ALL" and focus_level == "Selected view":
         state_model_view = growth_states[growth_states["State Abbr"].eq(selected_state)].copy()
         state_projection_view = growth_projection[growth_projection["State Abbr"].eq(selected_state)].copy()
         store_model_view = growth_stores[growth_stores["State Abbr"].eq(selected_state)].copy()
     else:
-        state_model_view = growth_states.copy()
-        state_projection_view = growth_projection.copy()
-        store_model_view = growth_stores.copy()
-
-    st.markdown("#### How the model works")
-    st.write(
-        "The model is intentionally explainable rather than a black-box forecast. It first calculates each state's actual 2021-2024 store-volume CAGR and latest YoY growth. "
-        "It then builds macro features from the bundled GDP file, including long-run GDP CAGR, 10-year GDP CAGR, GDP volatility, population growth, store density, revenue per capita, revenue per GDP, store productivity, and maturity. "
-        "A regularized ridge model is fit across states to estimate how those macro conditions relate to recent store growth. The final growth rate blends measured store momentum, state momentum, macro-model growth, population/GDP signal, and national mean reversion. "
-        "Small-store-count states are pulled more toward the national trend because a single store can make growth look artificially high or low. Store-level projections then blend each store's own momentum with its state model and productivity index."
-    )
-
+        state_model_view = growth_states.copy(); state_projection_view = growth_projection.copy(); store_model_view = growth_stores.copy()
+    st.markdown("#### Model structure")
+    st.write("The projection uses five layers: store momentum, state trend, macro GDP/population trend, saturation/white-space pressure, and maturity/productivity adjustment. Low-store-count states are pulled toward the national trend to reduce one-store distortion.")
     if not state_model_view.empty:
         total_2024 = state_model_view["Volume_2024"].sum()
         total_target = state_model_view[f"Projected_{target_year}_Volume"].sum()
         target_change = total_target - total_2024
         blended_growth = (total_target / total_2024) ** (1 / projection_horizon) - 1 if total_2024 else np.nan
-        k1, k2, k3, k4 = st.columns(4)
+        k1,k2,k3,k4=st.columns(4)
         k1.metric(f"Projected {target_year} Volume", fmt_money(total_target), delta=fmt_money(target_change))
         k2.metric("Implied Annual Growth", fmt_pct(blended_growth))
-        k3.metric("Avg Model Confidence", fmt_float(state_model_view["Model_Confidence"].mean(), 1) + "/100")
+        k3.metric("Avg Model Confidence", fmt_float(state_model_view["Model_Confidence"].mean(),1)+"/100")
         k4.metric("States in Model View", fmt_num(state_model_view["State Abbr"].nunique()))
-
-    c1, c2 = st.columns(2)
+    c1,c2=st.columns(2)
     with c1:
         if not state_projection_view.empty:
-            if selected_state == "ALL" or focus_level != "Selected view":
-                national_proj = state_projection_view.groupby("Year", as_index=False).agg(
-                    **{"Projected Volume": ("Projected Volume", "sum"), "Low Case Volume": ("Low Case Volume", "sum"), "High Case Volume": ("High Case Volume", "sum")}
-                )
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=national_proj["Year"], y=national_proj["High Case Volume"], mode="lines", name="High Case", line=dict(width=0), showlegend=False))
-                fig.add_trace(go.Scatter(x=national_proj["Year"], y=national_proj["Low Case Volume"], mode="lines", name="Low Case", fill="tonexty", line=dict(width=0), fillcolor="rgba(128,128,128,.22)", showlegend=False))
-                fig.add_trace(go.Scatter(x=national_proj["Year"], y=national_proj["Projected Volume"], mode="lines+markers", name="Base Projection"))
-                fig.update_layout(title=f"Projected Volume Path — {scenario} Scenario", height=430, margin=dict(l=10, r=10, t=50, b=10), yaxis_tickprefix="$")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=state_projection_view["Year"], y=state_projection_view["High Case Volume"], mode="lines", name="High Case", line=dict(width=0), showlegend=False))
-                fig.add_trace(go.Scatter(x=state_projection_view["Year"], y=state_projection_view["Low Case Volume"], mode="lines", name="Low Case", fill="tonexty", line=dict(width=0), fillcolor="rgba(128,128,128,.22)", showlegend=False))
-                fig.add_trace(go.Scatter(x=state_projection_view["Year"], y=state_projection_view["Projected Volume"], mode="lines+markers", name="Base Projection"))
-                fig.update_layout(title=f"Projected Volume Path — {selected_label}", height=430, margin=dict(l=10, r=10, t=50, b=10), yaxis_tickprefix="$")
-                st.plotly_chart(fig, use_container_width=True)
+            national_proj = state_projection_view.groupby("Year", as_index=False).agg(**{"Projected Volume":("Projected Volume","sum"),"Low Case Volume":("Low Case Volume","sum"),"High Case Volume":("High Case Volume","sum")}) if (selected_state == "ALL" or focus_level != "Selected view") else state_projection_view
+            fig=go.Figure()
+            fig.add_trace(go.Scatter(x=national_proj["Year"], y=national_proj["High Case Volume"], mode="lines", name="High", line=dict(width=0), showlegend=False))
+            fig.add_trace(go.Scatter(x=national_proj["Year"], y=national_proj["Low Case Volume"], mode="lines", name="Low", fill="tonexty", line=dict(width=0), fillcolor="rgba(128,128,128,.22)", showlegend=False))
+            fig.add_trace(go.Scatter(x=national_proj["Year"], y=national_proj["Projected Volume"], mode="lines+markers", name="Base Projection"))
+            fig.update_layout(title=f"Projected Volume Path — {scenario}", height=430, margin=dict(l=10,r=10,t=50,b=10), yaxis_tickprefix="$")
+            st.plotly_chart(fig, use_container_width=True)
     with c2:
         rank_states = state_model_view.sort_values(f"Projected_{target_year}_Change", ascending=False)
         if not rank_states.empty:
-            st.plotly_chart(
-                bar_chart(rank_states, "State", f"Projected_{target_year}_Change", f"Largest Projected Volume Gains by {target_year}"),
-                use_container_width=True,
-            )
+            st.plotly_chart(bar_chart(rank_states, "State", f"Projected_{target_year}_Change", f"Projected Volume Change by {target_year}"), use_container_width=True)
+    state_cols=safe_col_list(state_model_view,["State","State Abbr","Store_Count","Volume_2024",f"Projected_{target_year}_Volume",f"Projected_{target_year}_Change","Projected_Growth_Rate","Macro_Growth_Signal","Population_Growth_23_24","GDP_CAGR_10Y","CAGR_21_24","Growth_24_vs_23","Stores_per_1M_People","Revenue_per_Capita","Model_Confidence","Uncertainty"])
+    st.markdown("#### State projection table")
+    display_df(state_model_view[state_cols].sort_values(f"Projected_{target_year}_Change", ascending=False), money_cols=["Volume_2024",f"Projected_{target_year}_Volume",f"Projected_{target_year}_Change","Revenue_per_Capita"], pct_cols=["Projected_Growth_Rate","Macro_Growth_Signal","Population_Growth_23_24","GDP_CAGR_10Y","CAGR_21_24","Growth_24_vs_23","Uncertainty"], height=360)
+    st.markdown("#### Store projection table")
+    store_cols=safe_col_list(store_model_view,["Store Number - Name","City","State","24 Volume Dollars",f"Projected {target_year} Volume","Projected Volume Change","Projected Store Growth","Projection Uncertainty","Productivity Index","Store Diagnostic"])
+    display_df(store_model_view[store_cols].sort_values("Projected Volume Change", ascending=False), money_cols=["24 Volume Dollars",f"Projected {target_year} Volume","Projected Volume Change"], pct_cols=["Projected Store Growth","Projection Uncertainty"], height=360)
+    if not coef_df.empty:
+        st.markdown("#### Model coefficients")
+        display_df(coef_df, height=260)
 
-    c3, c4 = st.columns(2)
-    with c3:
-        if not state_model_view.empty:
-            fig = px.scatter(
-                state_model_view,
-                x="Population_Growth_23_24",
-                y="Projected_Growth_Rate",
-                size="Store_Count",
-                color="GDP_CAGR_10Y" if "GDP_CAGR_10Y" in state_model_view.columns else None,
-                hover_name="State",
-                title="Population Growth vs Projected Store Growth",
-            )
-            fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10), xaxis_tickformat=".1%", yaxis_tickformat=".1%")
-            st.plotly_chart(fig, use_container_width=True)
-    with c4:
-        if not state_model_view.empty:
-            fig = px.scatter(
-                state_model_view,
-                x="GDP_CAGR_10Y" if "GDP_CAGR_10Y" in state_model_view.columns else "Macro_Growth_Signal",
-                y="Projected_Growth_Rate",
-                size="Volume_2024",
-                color="Model_Confidence",
-                hover_name="State",
-                title="GDP Trend vs Projected Store Growth",
-            )
-            fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10), xaxis_tickformat=".1%", yaxis_tickformat=".1%")
-            st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("#### State Projection Table")
-    state_cols = [
-        "State", "State Abbr", "Store_Count", "Volume_2024", f"Projected_{target_year}_Volume", f"Projected_{target_year}_Change",
-        "Projected_Growth_Rate", "Macro_Growth_Signal", "Population_Growth_23_24", "GDP_CAGR_10Y", "CAGR_21_24", "Growth_24_vs_23",
-        "Stores_per_1M_People", "Revenue_per_Capita", "Model_Confidence", "Uncertainty",
-    ]
-    state_cols = [c for c in state_cols if c in state_model_view.columns]
-    display_df(
-        state_model_view[state_cols].sort_values(f"Projected_{target_year}_Change", ascending=False),
-        money_cols=["Volume_2024", f"Projected_{target_year}_Volume", f"Projected_{target_year}_Change", "Revenue_per_Capita"],
-        pct_cols=["Projected_Growth_Rate", "Macro_Growth_Signal", "Population_Growth_23_24", "GDP_CAGR_10Y", "CAGR_21_24", "Growth_24_vs_23", "Uncertainty"],
-        height=430,
-    )
-
-    st.markdown("#### Store-Level Projection Table")
-    store_cols = [
-        "Store Number - Name", "City", "State", "24 Volume Dollars", f"Projected {target_year} Volume", "Projected Volume Change",
-        "Projected Store Growth", "State Projected Growth", "Store Momentum CAGR", "Last YoY Growth", "Productivity Index", "Revenue per Sq. Ft.", f"Projected {target_year} Low", f"Projected {target_year} High",
-    ]
-    store_cols = [c for c in store_cols if c in store_model_view.columns]
-    display_df(
-        store_model_view[store_cols].sort_values("Projected Volume Change", ascending=False),
-        money_cols=["24 Volume Dollars", f"Projected {target_year} Volume", "Projected Volume Change", "Revenue per Sq. Ft.", f"Projected {target_year} Low", f"Projected {target_year} High"],
-        pct_cols=["Projected Store Growth", "State Projected Growth", "Store Momentum CAGR", "Last YoY Growth"],
-        height=430,
-    )
-
-    with st.expander("Model coefficients and diagnostics"):
-        st.write("Positive coefficients increase the model-implied CAGR; negative coefficients decrease it. Coefficients are standardized because the ridge model standardizes features internally.")
-        if not coef_df.empty:
-            st.dataframe(coef_df.sort_values("Coefficient", ascending=False), use_container_width=True, height=300)
-        diag_cols = [c for c in ["State", "Target_CAGR", "Macro_Model_CAGR", "Model_Residual", "Base_Projected_Growth", "Projected_Growth_Rate", "Uncertainty", "Model_Confidence"] if c in growth_states.columns]
-        if diag_cols:
-            display_df(growth_states[diag_cols].sort_values("Model_Residual", ascending=False), pct_cols=["Target_CAGR", "Macro_Model_CAGR", "Model_Residual", "Base_Projected_Growth", "Projected_Growth_Rate", "Uncertainty"], height=300)
-
-# 10 Store Maturity
-with tabs[9]:
-    st.markdown("### Store Age / Maturity Analysis")
-    st.caption("Uses Grand Opening to compare new, ramping, mature, and legacy stores.")
-    mat = scope.copy()
-    c1, c2 = st.columns(2)
-    if "Maturity Band" in mat.columns:
-        maturity = mat.groupby("Maturity Band", dropna=False).agg(
-            Stores=("State", "count"),
-            Volume_2024=("24 Volume Dollars", "sum"),
-            Avg_Volume=("24 Volume Dollars", "mean"),
-            Avg_Rev_per_SqFt=("Revenue per Sq. Ft.", "mean"),
-            Avg_Growth=("YoY Growth 24 vs 23", "mean"),
-        ).reset_index()
-        with c1:
-            st.plotly_chart(bar_chart(maturity, "Maturity Band", "Avg_Rev_per_SqFt", "Revenue / Sq. Ft. by Maturity"), use_container_width=True)
-        with c2:
-            st.plotly_chart(bar_chart(maturity, "Maturity Band", "Avg_Growth", "Growth by Maturity"), use_container_width=True)
-        st.markdown("#### Maturity Summary")
-        display_df(maturity, money_cols=["Volume_2024", "Avg_Volume", "Avg_Rev_per_SqFt"], pct_cols=["Avg_Growth"], height=240)
-    age_cols = [c for c in ["Store Number - Name", "City", "State", "Grand Opening Date", "Grand Opening Year", "Store Age", "Maturity Band", "24 Volume Dollars", "Revenue per Sq. Ft.", "YoY Growth 24 vs 23"] if c in mat.columns]
-    display_df(mat[age_cols].sort_values("Store Age", ascending=False), money_cols=["24 Volume Dollars", "Revenue per Sq. Ft."], pct_cols=["YoY Growth 24 vs 23"], height=430)
-
-# -----------------------------
-# Data audit expander
-# -----------------------------
-with st.expander("Data audit and raw normalized store data"):
-    st.write("Uploaded rows:", len(stores))
-    st.write("Volume scale applied:", f"x{stores.attrs.get('volume_scale', 1):,.0f}")
-    st.write("Coordinate source:", stores.get("Coordinate Source", pd.Series(dtype=str)).value_counts().to_dict())
-    st.write("Columns:", list(stores.columns))
-    st.dataframe(stores, use_container_width=True, height=360)
+# 15 Stability
+with tabs[14]:
+    st.markdown("### Volume Stability / Consistency")
+    st.info("Stability helps separate reliable stores from stores with large year-to-year swings.")
+    c1,c2=st.columns(2)
+    with c1:
+        st.plotly_chart(bar_chart(scope.sort_values("Stability Score", ascending=False), "Stability Score", "Store Number - Name", "Most Stable Stores", "h"), use_container_width=True)
+    with c2:
+        st.plotly_chart(bar_chart(scope.sort_values("Stability Score", ascending=True), "Stability Score", "Store Number - Name", "Most Volatile Stores", "h"), use_container_width=True)
+    cols=safe_col_list(scope,["Store Number - Name","State","21 Volume Dollars","22 Volume Dollars","23 Volume Dollars","24 Volume Dollars","Volume CV","Stability Score","Productivity Index"])
+    display_df(scope.sort_values("Stability Score", ascending=False)[cols], money_cols=["21 Volume Dollars","22 Volume Dollars","23 Volume Dollars","24 Volume Dollars"], height=430)
